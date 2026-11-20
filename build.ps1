@@ -10,7 +10,10 @@ if (!(Test-Path -LiteralPath $compiler -PathType Leaf)) {
 $output = Join-Path $PSScriptRoot 'bin'
 $null = New-Item -Path $output -ItemType Directory -Force
 $sources = @(Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'src') -Filter '*.cs' -File | ForEach-Object FullName)
-$references = @('System.Xaml.dll', 'WPF\WindowsBase.dll', 'WPF\PresentationCore.dll', 'WPF\PresentationFramework.dll') |
+$references = @(
+    'System.Xaml.dll', 'WPF\WindowsBase.dll', 'WPF\PresentationCore.dll', 'WPF\PresentationFramework.dll',
+    'WPF\UIAutomationClient.dll', 'WPF\UIAutomationTypes.dll'
+) |
     ForEach-Object { '/reference:' + (Join-Path $framework $_) }
 $application = Join-Path $output 'DesktopIconFlick.exe'
 $manifest = Join-Path $PSScriptRoot 'src\app.manifest'

@@ -145,12 +145,18 @@ namespace DesktopIconFlick
     {
         public const double Duration = 30;
         private const double TargetDistance = 12;
+        private const double SpawnHalfWidth = 0.18;
+        private const double SpawnHalfHeightLimit = 0.14;
+        private const double SpawnVerticalViewportFraction = 0.27;
+        private const int SpawnColumns = 5;
+        private const int SpawnRows = 3;
         private readonly Func<double> now;
         private readonly Random random;
         private readonly List<Target> targets = new List<Target>(3);
         private readonly IList<Target> readOnlyTargets;
+        private readonly Vector[] spawnCenters = new Vector[SpawnColumns * SpawnRows];
         private int nextId;
-        private double used, startedAt, viewportWidth, viewportHeight;
+        private double used, startedAt;
 
         public TrainingRound(Func<double> now, int seed)
         {
@@ -170,15 +176,14 @@ namespace DesktopIconFlick
         public void Start(AimSettings settings, double width, double height)
         {
             Camera = new AimCamera(settings);
-            viewportWidth = width;
-            viewportHeight = height;
+            SetSpawnCenters(width, height);
             used = 0;
             Hits = 0;
             Shots = 0;
             nextId = 0;
             targets.Clear();
             while (targets.Count < 3)
-                targets.Add(Spawn(null));
+                targets.Add(Spawn(true));
             startedAt = now();
             State = RoundState.Active;
         }
@@ -230,6 +235,13 @@ namespace DesktopIconFlick
 
         public bool Input(int horizontal, int vertical, bool pressed)
         {
+            Target removed, replacement;
+            return Input(horizontal, vertical, pressed, out removed, out replacement);
+        }
+
+        public bool Input(int horizontal, int vertical, bool pressed, out Target removed, out Target replacement)
+        {
+            removed = replacement = null;
             Tick();
             if (State != RoundState.Active)
                 return false;
@@ -252,26 +264,39 @@ namespace DesktopIconFlick
             if (hit < 0)
                 return false;
 
-            Target old = targets[hit];
-            targets[hit] = Spawn(old);
+            replacement = Spawn(false);
+            removed = targets[hit];
+            targets[hit] = replacement;
             Hits++;
             return true;
         }
 
-        private Target Spawn(Target removed)
+        private void SetSpawnCenters(double width, double height)
         {
-            double horizontal = Math.Min(0.65, Camera.HalfWidthSlope * 0.68);
-            double vertical = Math.Min(0.55, Camera.HalfWidthSlope * viewportHeight / viewportWidth * 0.68);
-            int start = random.Next(35);
-            for (int offset = 0; offset < 35; offset++)
+            // Store opening-camera rays in world space. Even when the rows are close,
+            // the spacing between columns guarantees room for a replacement.
+            double verticalHalfSlope = Camera.HalfWidthSlope * height / width;
+            double vertical = Math.Min(SpawnHalfHeightLimit, verticalHalfSlope * SpawnVerticalViewportFraction);
+            for (int row = 0; row < SpawnRows; row++)
+                for (int column = 0; column < SpawnColumns; column++)
+                {
+                    double x = SpawnHalfWidth * (column - SpawnColumns / 2) / (SpawnColumns / 2);
+                    double y = vertical * (row - SpawnRows / 2) / (SpawnRows / 2);
+                    spawnCenters[row * SpawnColumns + column] = Camera.Ray(x, y).Scale(TargetDistance);
+                }
+        }
+
+        private Target Spawn(bool opening)
+        {
+            double spacing = Target.Radius * 2.5;
+            int start = random.Next(spawnCenters.Length);
+            for (int offset = 0; offset < spawnCenters.Length; offset++)
             {
-                int cell = (start + offset * 12) % 35;
-                Vector direction = Camera.Ray((cell % 7 - 3) * horizontal / 3, (cell / 7 - 2) * vertical / 2);
-                if (direction.Dot(Camera.Forward) > 0.9985)
+                Vector center = spawnCenters[(start + offset) % spawnCenters.Length];
+                if (opening && center.Z > TargetDistance * 0.9985)
                     continue;
-                Vector center = direction.Scale(TargetDistance);
-                double spacing = Target.Radius * 2.5;
                 bool clear = true;
+                // The hit target stays in this list until its replacement is picked.
                 foreach (Target target in targets)
                 {
                     Vector delta = center.Subtract(target.Center);
@@ -280,11 +305,6 @@ namespace DesktopIconFlick
                         clear = false;
                         break;
                     }
-                }
-                if (clear && removed != null)
-                {
-                    Vector delta = center.Subtract(removed.Center);
-                    clear = delta.Dot(delta) >= spacing * spacing;
                 }
                 if (clear)
                     return new Target(center, nextId++);

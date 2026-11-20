@@ -7,7 +7,6 @@ namespace DesktopIconFlick
 {
     internal sealed class RangeSurface : FrameworkElement
     {
-        private static readonly Brush TargetFill = Paint(244, 21, 46, 50);
         private static readonly Brush BallFill = Paint(255, 163, 247, 217);
         private static readonly Pen Outline = Stroke(Paint(255, 8, 27, 29), 5);
         private static readonly Pen Ring = Stroke(BallFill, 2);
@@ -15,9 +14,8 @@ namespace DesktopIconFlick
         private static readonly Pen Crosshair = Stroke(Brushes.White, 1.5);
         private static readonly Pen HitMark = Stroke(BallFill, 2);
         private readonly TrainingRound round;
+        private readonly TargetIcons icons;
         private readonly List<DrawTarget> visible = new List<DrawTarget>(3);
-        public IList<ImageSource> Icons { get; set; }
-        public bool UseIcons { get; set; }
         public bool Flash { get; set; }
 
         private struct DrawTarget
@@ -26,10 +24,10 @@ namespace DesktopIconFlick
             public Projection Projection;
         }
 
-        public RangeSurface(TrainingRound round)
+        public RangeSurface(TrainingRound round, TargetIcons icons)
         {
             this.round = round;
-            Icons = new ImageSource[0];
+            this.icons = icons;
             IsHitTestVisible = false;
         }
 
@@ -51,17 +49,22 @@ namespace DesktopIconFlick
             {
                 Projection projected = entry.Projection;
                 var center = new Point(projected.X, projected.Y);
-                bool icon = UseIcons && Icons.Count != 0;
+                DesktopIcon icon = icons.For(entry.Target);
+                if (icon != null)
+                {
+                    ImageSource art = icon.Image;
+                    // Fit the image diagonal within the smaller diameter of the projected hit sphere.
+                    double diagonal = Math.Sqrt(art.Width * art.Width + art.Height * art.Height);
+                    double scale = 2 * projected.TangentRadius / diagonal;
+                    double iconWidth = art.Width * scale, iconHeight = art.Height * scale;
+                    drawing.DrawImage(art, new Rect(center.X - iconWidth / 2, center.Y - iconHeight / 2, iconWidth, iconHeight));
+                    continue;
+                }
+
                 drawing.PushTransform(new RotateTransform(projected.Rotation, center.X, center.Y));
-                drawing.DrawEllipse(icon ? TargetFill : BallFill, Outline, center, projected.RadialRadius, projected.TangentRadius);
+                drawing.DrawEllipse(BallFill, Outline, center, projected.RadialRadius, projected.TangentRadius);
                 drawing.DrawEllipse(null, Ring, center, projected.RadialRadius, projected.TangentRadius);
                 drawing.Pop();
-                if (icon)
-                {
-                    ImageSource art = Icons[entry.Target.Id % Icons.Count];
-                    double size = projected.TangentRadius * 1.28;
-                    drawing.DrawImage(art, new Rect(center.X - size / 2, center.Y - size / 2, size, size));
-                }
             }
             double middleX = width / 2, middleY = height / 2;
             DrawCross(drawing, CrosshairEdge, middleX, middleY);

@@ -4,8 +4,10 @@ using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security;
+using System.Text;
 using System.Threading;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -190,8 +192,26 @@ namespace DesktopIconFlick
 
     }
 
+    internal sealed class DesktopIcon
+    {
+        public readonly ImageSource Image;
+        public readonly Rect DesktopBounds;
+        public readonly string DesktopName;
+
+        public DesktopIcon(ImageSource image, Rect desktopBounds, string desktopName = null)
+        {
+            Image = image;
+            DesktopBounds = desktopBounds;
+            DesktopName = desktopName;
+        }
+    }
+
     internal static class ShellIcons
     {
+        private const int IconLimit = 64;
+
+        private delegate bool EnumWindowCallback(IntPtr window, IntPtr data);
+
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         private struct FileInfo
         {
@@ -211,17 +231,32 @@ namespace DesktopIconFlick
         [DllImport("user32.dll")]
         private static extern bool DestroyIcon(IntPtr icon);
 
-        public static void LoadAsync(Action<IList<ImageSource>> done)
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetShellWindow();
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowCallback callback, IntPtr data);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumChildWindows(IntPtr parent, EnumWindowCallback callback, IntPtr data);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetClassName(IntPtr window, StringBuilder name, int capacity);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr window);
+
+        public static void LoadAsync(Action<IList<DesktopIcon>> done)
         {
             var worker = new Thread(() => done(Load())) { IsBackground = true };
             worker.SetApartmentState(ApartmentState.STA);
             worker.Start();
         }
 
-        internal static IList<ImageSource> Load()
+        internal static IList<DesktopIcon> Load()
         {
-            var icons = new List<ImageSource>();
-            ReadDesktopNamespace(icons);
+            var icons = new List<DesktopIcon>();
+            ReadDesktopNamespace(icons, ReadDesktopItemBounds());
             if (icons.Count == 0)
             {
                 ReadDesktopDirectory(Environment.SpecialFolder.DesktopDirectory, icons);
@@ -230,7 +265,102 @@ namespace DesktopIconFlick
             return icons;
         }
 
-        private static void ReadDesktopNamespace(List<ImageSource> icons)
+        internal static IntPtr DesktopViewWindow()
+        {
+            IntPtr listView = FindDesktopList(GetShellWindow());
+            if (listView != IntPtr.Zero)
+                return listView;
+            var className = new StringBuilder(64);
+            EnumWindows((window, data) =>
+            {
+                if (GetClassName(window, className, className.Capacity) != 0 && className.ToString() == "WorkerW")
+                    listView = FindDesktopList(window);
+                return listView == IntPtr.Zero;
+            }, IntPtr.Zero);
+            return listView;
+        }
+
+        private static IntPtr FindDesktopList(IntPtr host)
+        {
+            IntPtr view = FindVisibleChild(host, "SHELLDLL_DefView");
+            return FindVisibleChild(view, "SysListView32");
+        }
+
+        private static IntPtr FindVisibleChild(IntPtr parent, string requiredClass)
+        {
+            if (parent == IntPtr.Zero)
+                return IntPtr.Zero;
+            IntPtr match = IntPtr.Zero;
+            var className = new StringBuilder(64);
+            EnumChildWindows(parent, (window, data) =>
+            {
+                if (GetClassName(window, className, className.Capacity) != 0 &&
+                    className.ToString() == requiredClass && IsWindowVisible(window))
+                    match = window;
+                return match == IntPtr.Zero;
+            }, IntPtr.Zero);
+            return match;
+        }
+
+        internal static Dictionary<string, Rect> ReadDesktopItemBounds()
+        {
+            var bounds = new Dictionary<string, Rect>(StringComparer.Ordinal);
+            IntPtr listView = DesktopViewWindow();
+            if (listView == IntPtr.Zero)
+                return bounds;
+            try
+            {
+                AutomationElement desktop = AutomationElement.FromHandle(listView);
+                var cache = new CacheRequest { AutomationElementMode = AutomationElementMode.None };
+                cache.Add(AutomationElement.NameProperty);
+                cache.Add(AutomationElement.BoundingRectangleProperty);
+                cache.Add(AutomationElement.IsOffscreenProperty);
+                var visibleItems = new List<KeyValuePair<string, Rect>>();
+                using (cache.Activate())
+                {
+                    var items = desktop.FindAll(TreeScope.Children,
+                        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ListItem));
+                    foreach (AutomationElement item in items)
+                    {
+                        var properties = item.Cached;
+                        string name = properties.Name;
+                        Rect rectangle = properties.BoundingRectangle;
+                        bool visible = !properties.IsOffscreen && rectangle.Width > 0 && rectangle.Height > 0;
+                        if (visible)
+                            visibleItems.Add(new KeyValuePair<string, Rect>(name, rectangle));
+                        if (!string.IsNullOrEmpty(name))
+                            bounds[name] = visible && !bounds.ContainsKey(name) ? rectangle : Rect.Empty;
+                    }
+                }
+                ExcludeOverlappingBounds(bounds, visibleItems);
+            }
+            catch (ElementNotAvailableException) { bounds.Clear(); }
+            catch (COMException) { bounds.Clear(); }
+            catch (InvalidOperationException) { bounds.Clear(); }
+            catch (ArgumentException) { bounds.Clear(); }
+            return bounds;
+        }
+
+        private static void ExcludeOverlappingBounds(Dictionary<string, Rect> bounds, List<KeyValuePair<string, Rect>> visibleItems)
+        {
+            for (int index = 0; index < visibleItems.Count; index++)
+            {
+                var item = visibleItems[index];
+                for (int next = index + 1; next < visibleItems.Count; next++)
+                {
+                    var other = visibleItems[next];
+                    Rect overlap = Rect.Intersect(item.Value, other.Value);
+                    if (overlap.Width <= 0 || overlap.Height <= 0)
+                        continue;
+                    if (!string.IsNullOrEmpty(item.Key))
+                        bounds[item.Key] = Rect.Empty;
+                    if (!string.IsNullOrEmpty(other.Key))
+                        bounds[other.Key] = Rect.Empty;
+                }
+            }
+        }
+
+        private static void ReadDesktopNamespace(List<DesktopIcon> icons, IDictionary<string, Rect> desktopBounds)
         {
             object shell = null, desktop = null, items = null;
             try
@@ -245,37 +375,19 @@ namespace DesktopIconFlick
                 items = Invoke(desktop, "Items", BindingFlags.InvokeMethod);
                 if (items == null)
                     return;
-                int count = Math.Min(64, (int)Invoke(items, "Count", BindingFlags.GetProperty));
-                for (int index = 0; index < count; index++)
+                int count = (int)Invoke(items, "Count", BindingFlags.GetProperty);
+                var excludedAliases = new HashSet<int>();
+                var matches = MatchDesktopItems(items, count, desktopBounds, excludedAliases);
+                for (int index = 0; index < count && icons.Count < IconLimit; index++)
                 {
-                    object item = null;
-                    IntPtr id = IntPtr.Zero;
-                    try
-                    {
-                        item = Invoke(items, "Item", BindingFlags.InvokeMethod, index);
-                        if (item != null)
-                        {
-                            ImageSource image = null;
-                            if (SHGetIDListFromObject(item, out id) >= 0 && id != IntPtr.Zero)
-                                image = ReadIcon(id);
-                            else
-                            {
-                                string path = Invoke(item, "Path", BindingFlags.GetProperty) as string;
-                                if (!string.IsNullOrEmpty(path))
-                                    image = ReadIcon(path);
-                            }
-                            if (image != null)
-                                icons.Add(image);
-                        }
-                    }
-                    catch (COMException) { }
-                    catch (TargetInvocationException) { }
-                    finally
-                    {
-                        if (id != IntPtr.Zero)
-                            Marshal.FreeCoTaskMem(id);
-                        Release(item);
-                    }
+                    string name;
+                    if (matches.TryGetValue(index, out name))
+                        ReadDesktopItem(icons, items, index, desktopBounds[name], name);
+                }
+                for (int index = 0; index < count && icons.Count < IconLimit; index++)
+                {
+                    if (!matches.ContainsKey(index) && !excludedAliases.Contains(index))
+                        ReadDesktopItem(icons, items, index, Rect.Empty, null);
                 }
             }
             catch (COMException) { }
@@ -288,7 +400,133 @@ namespace DesktopIconFlick
             }
         }
 
-        private static void ReadDesktopDirectory(Environment.SpecialFolder folder, List<ImageSource> icons)
+        private static Dictionary<int, string> MatchDesktopItems(object items, int count, IDictionary<string, Rect> desktopBounds,
+            ISet<int> excludedAliases)
+        {
+            var matches = new Dictionary<int, string>();
+            if (desktopBounds.Count == 0)
+                return matches;
+
+            var indices = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+            for (int index = 0; index < count; index++)
+            {
+                object item = null;
+                try
+                {
+                    item = Invoke(items, "Item", BindingFlags.InvokeMethod, index);
+                    string name = item == null ? null : Invoke(item, "Name", BindingFlags.GetProperty) as string;
+                    Rect bounds;
+                    if (string.IsNullOrEmpty(name) || !desktopBounds.TryGetValue(name, out bounds) || bounds.IsEmpty)
+                        continue;
+                    List<int> candidates;
+                    if (!indices.TryGetValue(name, out candidates))
+                    {
+                        candidates = new List<int>();
+                        indices.Add(name, candidates);
+                    }
+                    candidates.Add(index);
+                }
+                catch (COMException) { }
+                catch (TargetInvocationException) { }
+                finally { Release(item); }
+            }
+            var visibleItems = new Lazy<ISet<string>>(DesktopFolderView.ReadParsingNames);
+            foreach (var group in indices)
+            {
+                List<int> candidates = group.Value;
+                int selected = candidates[0];
+                if (candidates.Count > 1)
+                {
+                    selected = FindUniqueViewItem(candidates, visibleItems.Value, index => ReadParsingName(items, index));
+                    if (selected < 0)
+                        continue;
+                    foreach (int alias in candidates)
+                        if (alias != selected)
+                            excludedAliases.Add(alias);
+                }
+                matches.Add(selected, group.Key);
+            }
+            return matches;
+        }
+
+        internal static int FindUniqueViewItem(IList<int> candidates, ISet<string> visibleItems, Func<int, string> readParsingName)
+        {
+            if (visibleItems == null)
+                return -1;
+            int selected = -1;
+            string selectedIdentity = null;
+            foreach (int index in candidates)
+            {
+                string identity = readParsingName(index);
+                if (identity == null || !visibleItems.Contains(identity))
+                    continue;
+                if (selected >= 0)
+                {
+                    if (!string.Equals(selectedIdentity, identity, StringComparison.Ordinal))
+                        return -1;
+                    continue;
+                }
+                selected = index;
+                selectedIdentity = identity;
+            }
+            return selected;
+        }
+
+        private static string ReadParsingName(object items, int index)
+        {
+            object item = null;
+            IntPtr pidl = IntPtr.Zero;
+            try
+            {
+                item = Invoke(items, "Item", BindingFlags.InvokeMethod, index);
+                return item != null && SHGetIDListFromObject(item, out pidl) >= 0 ? DesktopFolderView.ParsingName(pidl) : null;
+            }
+            catch (COMException) { return null; }
+            catch (TargetInvocationException) { return null; }
+            finally
+            {
+                Marshal.FreeCoTaskMem(pidl);
+                Release(item);
+            }
+        }
+
+        private static void ReadDesktopItem(List<DesktopIcon> icons, object items, int index, Rect bounds, string name)
+        {
+            object item = null;
+            IntPtr id = IntPtr.Zero;
+            try
+            {
+                item = Invoke(items, "Item", BindingFlags.InvokeMethod, index);
+                if (item == null)
+                    return;
+                if (name != null && !string.Equals(name, Invoke(item, "Name", BindingFlags.GetProperty) as string, StringComparison.Ordinal))
+                {
+                    name = null;
+                    bounds = Rect.Empty;
+                }
+                ImageSource image = null;
+                if (SHGetIDListFromObject(item, out id) >= 0 && id != IntPtr.Zero)
+                    image = ReadIcon(id);
+                if (image == null)
+                {
+                    string path = Invoke(item, "Path", BindingFlags.GetProperty) as string;
+                    if (!string.IsNullOrEmpty(path))
+                        image = ReadIcon(path);
+                }
+                if (image != null)
+                    icons.Add(new DesktopIcon(image, bounds, name));
+            }
+            catch (COMException) { }
+            catch (TargetInvocationException) { }
+            finally
+            {
+                if (id != IntPtr.Zero)
+                    Marshal.FreeCoTaskMem(id);
+                Release(item);
+            }
+        }
+
+        private static void ReadDesktopDirectory(Environment.SpecialFolder folder, List<DesktopIcon> icons)
         {
             try
             {
@@ -297,7 +535,7 @@ namespace DesktopIconFlick
                     return;
                 foreach (string path in Directory.EnumerateFileSystemEntries(directory))
                 {
-                    if (icons.Count >= 64)
+                    if (icons.Count >= IconLimit)
                         break;
                     try
                     {
@@ -305,7 +543,7 @@ namespace DesktopIconFlick
                             continue;
                         ImageSource image = ReadIcon(path);
                         if (image != null)
-                            icons.Add(image);
+                            icons.Add(new DesktopIcon(image, Rect.Empty));
                     }
                     catch (Exception error)
                     {

@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
+using System.Linq;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
@@ -13,6 +15,8 @@ namespace DesktopIconFlick
 {
     internal sealed class TrainingWindow : Window
     {
+        private const int WallpaperChange = 0x0014;
+        private static readonly DesktopIcon[] NoIcons = new DesktopIcon[0];
         private static readonly Brush Shade = RangeSurface.Paint(70, 8, 23, 27);
         private static readonly Brush Ink = RangeSurface.Paint(255, 17, 38, 41);
         private static readonly Brush Muted = RangeSurface.Paint(255, 192, 219, 216);
@@ -21,6 +25,8 @@ namespace DesktopIconFlick
         private readonly TrainingRound round;
         private readonly TrainingProfile profile;
         private readonly RangeSurface surface;
+        private readonly TargetIcons targetIcons = new TargetIcons();
+        private readonly DesktopHitSurface desktopHits;
         private readonly Border panel, hud;
         private readonly TextBlock heading, details, notice, hudStats;
         private readonly TextBox dpiInput, distanceInput, fovInput;
@@ -29,9 +35,14 @@ namespace DesktopIconFlick
         private readonly Button action, abandon;
         private HwndSource source;
         private WindowsDesktop.Rect workArea;
+        private IList<DesktopIcon> desktopIcons = NoIcons;
+        private IntPtr desktopView;
+        private IntPtr liveWallpaperHost;
+        private LiveWallpaperReveal liveWallpaper;
+        private int desktopLoad;
         private readonly MouseSession mouse = new MouseSession();
         private RoundState shownState;
-        private bool displayQueued, iconsDone, closed;
+        private bool displayQueued, iconsDone, closed, refreshDesktopOnActivate, roundUsesIcons;
         private string message = "";
         private double hitUntil;
         private int shownSecond = -1, shownHits = -1, shownShots = -1;
@@ -56,7 +67,10 @@ namespace DesktopIconFlick
 
             var root = new Grid { Background = Shade, ClipToBounds = true };
             Content = root;
-            surface = new RangeSurface(round);
+            desktopHits = new DesktopHitSurface(round, targetIcons, Shade);
+            desktopHits.ReadObstructions = () => DesktopHitSurface.GetObstructions(source.Handle, desktopView);
+            root.Children.Add(desktopHits);
+            surface = new RangeSurface(round, targetIcons);
             root.Children.Add(surface);
 
             hudStats = Text("", 16, Brushes.White);
@@ -97,7 +111,7 @@ namespace DesktopIconFlick
             settings = settingGroup;
 
             action = ControlButton("开始训练", Accent, Ink, StartOrResume);
-            abandon = ControlButton("结束本局", Muted, Ink, () => { round.Cancel(); ShowState(); });
+            abandon = ControlButton("结束本局", Muted, Ink, () => { round.Cancel(); targetIcons.Clear(); ShowState(); });
             var exit = ControlButton("退出", Brushes.Transparent, Brushes.White, Close);
             var controls = new WrapPanel();
             controls.Children.Add(action);
@@ -125,7 +139,16 @@ namespace DesktopIconFlick
             iconInput.Checked += (sender, args) => RefreshNotice();
             iconInput.Unchecked += (sender, args) => RefreshNotice();
             SourceInitialized += InitializeSource;
-            Deactivated += (sender, args) => PauseRound("切出窗口，对局已暂停。");
+            Activated += (sender, args) =>
+            {
+                if (refreshDesktopOnActivate && !displayQueued)
+                    LoadDesktop();
+            };
+            Deactivated += (sender, args) =>
+            {
+                refreshDesktopOnActivate = true;
+                PauseRound("切出窗口，对局已暂停。");
+            };
             Closing += (sender, args) => ReleaseInput();
             Closed += CloseSource;
             PreviewKeyDown += HandleKey;
@@ -139,19 +162,51 @@ namespace DesktopIconFlick
             workArea = WindowsDesktop.PrimaryWorkArea();
             WindowsDesktop.Place(source.Handle, workArea);
             CompositionTarget.Rendering += Advance;
-            ShellIcons.LoadAsync(icons => Dispatcher.BeginInvoke(new Action(() =>
+            LoadDesktop();
+        }
+
+        private void LoadDesktop()
+        {
+            refreshDesktopOnActivate = false;
+            int request = ++desktopLoad;
+            var desktopArea = new Rect(workArea.Left, workArea.Top, workArea.Width, workArea.Height);
+            desktopHits.DesktopArea = desktopArea;
+            desktopHits.Wallpaper = null;
+            desktopView = IntPtr.Zero;
+            liveWallpaperHost = IntPtr.Zero;
+            UpdateDesktopHits();
+            iconsDone = false;
+            RefreshNotice();
+            ShellIcons.LoadAsync(icons =>
             {
-                if (closed)
-                    return;
-                surface.Icons = icons;
-                iconsDone = true;
-                RefreshNotice();
-            })));
+                var verifiedBounds = new Dictionary<string, Rect>(StringComparer.Ordinal);
+                foreach (DesktopIcon icon in icons)
+                    if (icon.DesktopName != null && !icon.DesktopBounds.IsEmpty)
+                        verifiedBounds[icon.DesktopName] = icon.DesktopBounds;
+                IntPtr view = verifiedBounds.Count == 0 ? IntPtr.Zero : ShellIcons.DesktopViewWindow();
+                IntPtr liveHost = view == IntPtr.Zero ? IntPtr.Zero : DesktopWallpaper.FindLiveHost();
+                DesktopWallpaper wallpaper = view == IntPtr.Zero || liveHost != IntPtr.Zero ? null : DesktopWallpaper.Load();
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (closed || request != desktopLoad)
+                        return;
+                    desktopIcons = icons.OrderByDescending(icon => !icon.DesktopBounds.IsEmpty &&
+                        desktopArea.IntersectsWith(icon.DesktopBounds)).ToArray();
+                    iconsDone = true;
+                    desktopView = view;
+                    liveWallpaperHost = liveHost;
+                    desktopHits.VerifiedBounds = verifiedBounds;
+                    desktopHits.Wallpaper = wallpaper;
+                    UpdateDesktopHits();
+                    RefreshNotice();
+                }));
+            });
         }
 
         private void CloseSource(object sender, EventArgs args)
         {
             closed = true;
+            CloseLiveWallpaper();
             ReleaseInput();
             CompositionTarget.Rendering -= Advance;
             if (source != null && !source.IsDisposed)
@@ -165,13 +220,7 @@ namespace DesktopIconFlick
                 int horizontal, vertical;
                 bool pressed;
                 if (WindowsDesktop.ReadMouse(data, out horizontal, out vertical, out pressed))
-                {
-                    if (report != null && (horizontal != 0 || vertical != 0) && round.State == RoundState.Active && round.Remaining > 0)
-                        motionPacketCount++;
-                    if (round.Input(horizontal, vertical, pressed))
-                        hitUntil = clock.Elapsed.TotalSeconds + 0.08;
-                    TransitionAfterTick();
-                }
+                    ApplyRoundInput(horizontal, vertical, pressed);
             }
             else if (messageId == WindowsDesktop.DisplayChange || messageId == WindowsDesktop.DpiChange ||
                      (messageId == WindowsDesktop.SettingChange && param.ToInt64() == WindowsDesktop.WorkAreaChange))
@@ -184,6 +233,8 @@ namespace DesktopIconFlick
                     {
                         ReleaseInput();
                         round.Cancel();
+                        targetIcons.Clear();
+                        UpdateDesktopHits();
                         message = "显示设置已变化，请重新开始。";
                     }
                     Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() =>
@@ -193,11 +244,57 @@ namespace DesktopIconFlick
                             return;
                         workArea = WindowsDesktop.PrimaryWorkArea();
                         WindowsDesktop.Place(source.Handle, workArea);
+                        LoadDesktop();
                         ShowState();
                     }));
                 }
             }
+            else if (messageId == WindowsDesktop.SettingChange && param.ToInt64() == WallpaperChange && !displayQueued && !closed)
+                LoadDesktop();
             return IntPtr.Zero;
+        }
+
+        private void ApplyRoundInput(int horizontal, int vertical, bool pressed)
+        {
+            if (report != null && (horizontal != 0 || vertical != 0) && round.State == RoundState.Active && round.Remaining > 0)
+                motionPacketCount++;
+            Target removed, replacement;
+            if (round.Input(horizontal, vertical, pressed, out removed, out replacement))
+            {
+                if (targetIcons.Replace(removed, replacement))
+                    UpdateDesktopHits();
+                hitUntil = clock.Elapsed.TotalSeconds + 0.08;
+            }
+            TransitionAfterTick();
+        }
+
+        private void UpdateDesktopHits()
+        {
+            desktopHits.InvalidateVisual();
+            if (round.State != RoundState.Active || liveWallpaperHost == IntPtr.Zero)
+            {
+                CloseLiveWallpaper();
+                return;
+            }
+
+            foreach (DesktopIcon icon in targetIcons.Covered)
+            {
+                Rect bounds;
+                if (!desktopHits.TryGetDesktopBounds(icon, out bounds))
+                    continue;
+                if (liveWallpaper == null)
+                    liveWallpaper = new LiveWallpaperReveal(liveWallpaperHost, desktopView, workArea);
+                liveWallpaper.Show(bounds);
+            }
+        }
+
+        private void CloseLiveWallpaper()
+        {
+            if (liveWallpaper != null)
+            {
+                liveWallpaper.Dispose();
+                liveWallpaper = null;
+            }
         }
 
         private void HandleKey(object sender, KeyEventArgs args)
@@ -243,8 +340,9 @@ namespace DesktopIconFlick
                 motionPacketCount = 0;
                 sampledSeconds = 0;
                 lastRenderTime = TimeSpan.MinValue;
-                surface.UseIcons = profile.UseIcons && surface.Icons.Count > 0;
                 round.Start(profile.Aim, surface.ActualWidth, surface.ActualHeight);
+                roundUsesIcons = profile.UseIcons && desktopIcons.Count > 0;
+                targetIcons.Start(round.Targets, roundUsesIcons ? desktopIcons : NoIcons);
             }
             frameSampleStart = clock.Elapsed.TotalSeconds;
             hitUntil = 0;
@@ -333,12 +431,13 @@ namespace DesktopIconFlick
                 WindowsDesktop.Rect desktop = WindowsDesktop.VirtualScreen();
                 report(string.Format(CultureInfo.InvariantCulture,
                     "{0:O} appearance={1} work_area={2}x{3} dpi={4:0}x{5:0} shots={6} hits={7} render_callbacks={8} active_seconds={9:0.000} render_callbacks_per_second={10:0.0} move_packets={11} desktop_bounds={12},{13},{14},{15} monitors={16} primary_hz={17} os_build={18}",
-                    DateTimeOffset.Now, surface.UseIcons && surface.Icons.Count > 0 ? "icons" : "balls",
+                    DateTimeOffset.Now, roundUsesIcons ? "icons" : "balls",
                     workArea.Width, workArea.Height, scale.M11 * 96, scale.M22 * 96,
                     round.Shots, round.Hits, frameCount, sampledSeconds, sampledSeconds > 0 ? frameCount / sampledSeconds : 0,
                     motionPacketCount, desktop.Left, desktop.Top, desktop.Right, desktop.Bottom,
                     WindowsDesktop.MonitorCount(), WindowsDesktop.PrimaryRefreshRate(), Environment.OSVersion.Version.Build));
             }
+            targetIcons.Clear();
             ShowState();
         }
 
@@ -372,6 +471,7 @@ namespace DesktopIconFlick
                     break;
             }
             shownSecond = shownHits = shownShots = -1;
+            UpdateDesktopHits();
             surface.InvalidateVisual();
             if (active)
                 UpdateHud();
@@ -388,15 +488,21 @@ namespace DesktopIconFlick
             shownHits = round.Hits;
             shownShots = round.Shots;
             hudStats.Text = string.Format("{0:00} 秒  /  命中 {1}/{2}  /  {3}  ·  Esc 暂停", seconds, round.Hits, round.Shots,
-                surface.UseIcons ? "图标" : profile.UseIcons ? "小球（本局回退）" : "小球");
+                roundUsesIcons ? "图标" : profile.UseIcons ? "小球（本局回退）" : "小球");
         }
 
         private void RefreshNotice()
         {
+            bool wantsIcons = iconInput.IsChecked == true;
+            bool loadingIcons = wantsIcons && !iconsDone && round.State != RoundState.Paused;
+            action.IsEnabled = !loadingIcons;
             string helper = message.Length > 0 ? message : profile.Notice;
-            if (helper.Length == 0 && iconInput.IsChecked == true)
-                helper = !iconsDone ? "正在读取桌面图标，可先用小球开局。" :
-                    surface.Icons.Count == 0 ? "未读取到桌面图标，将使用普通小球。" : "只读使用你的桌面图标，不会移动或打开原项目。";
+            if (loadingIcons)
+                helper = "正在读取桌面图标。取消勾选可立即用小球开局。";
+            else if (helper.Length == 0 && wantsIcons && iconsDone)
+                helper = desktopIcons.Count == 0 ? "未读取到桌面图标，将使用普通小球。" :
+                    desktopHits.Wallpaper != null || liveWallpaperHost != IntPtr.Zero ?
+                        "命中后，可定位的原位图标会在本局暂时消失。" : "使用桌面图标副本进行训练。";
             notice.Text = helper;
             notice.Visibility = helper.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
         }
