@@ -26,7 +26,7 @@
 .\build.ps1 -Test
 .\tests\desktop-smoke.ps1
 $env:OPENSPEC_TELEMETRY='0'
-openspec validate add-desktop-flick-mvp --strict
+openspec validate --specs --strict
 ```
 
 自动测试覆盖灵敏度、连续补位、暂停时钟、图标来源和壁纸遮盖。冒烟脚本在交互式 Windows 会话中检查物理窗口边界、空白叠层是否接收鼠标命中，以及启动时光标是否自由。实机试玩步骤见 [桌面验收清单](docs/desktop-acceptance.md)。

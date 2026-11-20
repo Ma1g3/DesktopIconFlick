@@ -13,7 +13,7 @@
 - `.\build.ps1` 构建应用。用 `.\bin\DesktopIconFlick.exe` 启动，并将生成的 `.exe.config` 保留在可执行文件旁。
 - `.\build.ps1 -Test` 构建应用并运行 C# 断言测试。
 - `.\tests\desktop-smoke.ps1` 检查窗口边界、叠层命中和启动时光标是否可自由移动。先完成测试构建，再关闭已有应用实例，在交互式 Windows 会话中运行。
-- 安装 OpenSpec CLI 后，运行 `openspec validate add-desktop-flick-mvp --strict` 严格校验 MVP 变更。
+- 安装 OpenSpec CLI 后，运行 `openspec validate --specs --strict` 严格校验主规范。
 
 ## 代码风格与命名
 
