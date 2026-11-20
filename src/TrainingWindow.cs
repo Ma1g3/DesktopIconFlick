@@ -6,6 +6,7 @@ using System.Linq;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
+using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
@@ -21,18 +22,20 @@ namespace DesktopIconFlick
         private static readonly Brush Ink = RangeSurface.Paint(255, 17, 38, 41);
         private static readonly Brush Muted = RangeSurface.Paint(255, 192, 219, 216);
         private static readonly Brush Accent = RangeSurface.Paint(255, 163, 247, 217);
-        private readonly Stopwatch clock = Stopwatch.StartNew();
+        private readonly Func<double> now;
         private readonly TrainingRound round;
         private readonly TrainingProfile profile;
         private readonly RangeSurface surface;
         private readonly TargetIcons targetIcons = new TargetIcons();
         private readonly DesktopHitSurface desktopHits;
         private readonly Border panel, hud;
-        private readonly TextBlock heading, details, notice, hudStats;
+        private readonly TextBlock heading, details, notice, recordFeedback, hudTime, hudHits, hudShots, hudMode;
+        private readonly Run headingValue, headingUnit;
         private readonly TextBox dpiInput, distanceInput, fovInput;
         private readonly CheckBox iconInput;
         private readonly FrameworkElement settings;
         private readonly Button action, abandon;
+        private readonly WrapPanel controls;
         private HwndSource source;
         private WindowsDesktop.Rect workArea;
         private IList<DesktopIcon> desktopIcons = NoIcons;
@@ -41,6 +44,7 @@ namespace DesktopIconFlick
         private LiveWallpaperReveal liveWallpaper;
         private int desktopLoad;
         private readonly MouseSession mouse = new MouseSession();
+        private readonly HitSound hitSound = new HitSound();
         private RoundState shownState;
         private bool displayQueued, iconsDone, closed, refreshDesktopOnActivate, roundUsesIcons;
         private string message = "";
@@ -51,11 +55,17 @@ namespace DesktopIconFlick
         private long frameCount, motionPacketCount;
         private TimeSpan lastRenderTime = TimeSpan.MinValue;
 
-        public TrainingWindow(string profilePath, Action<string> report)
+        public TrainingWindow(string profilePath, Action<string> report, Func<double> now = null, int? seed = null)
         {
+            if (now == null)
+            {
+                var stopwatch = Stopwatch.StartNew();
+                now = () => stopwatch.Elapsed.TotalSeconds;
+            }
+            this.now = now;
             this.report = report;
             profile = TrainingProfile.Load(profilePath);
-            round = new TrainingRound(() => clock.Elapsed.TotalSeconds, Environment.TickCount);
+            round = new TrainingRound(now, seed ?? Environment.TickCount);
             Title = "桌面甩枪 · Desktop Icon Flick";
             WindowStyle = WindowStyle.None;
             ResizeMode = ResizeMode.NoResize;
@@ -68,22 +78,45 @@ namespace DesktopIconFlick
             var root = new Grid { Background = Shade, ClipToBounds = true };
             Content = root;
             desktopHits = new DesktopHitSurface(round, targetIcons, Shade);
-            desktopHits.ReadObstructions = () => DesktopHitSurface.GetObstructions(source.Handle, desktopView);
+            desktopHits.ReadObstructions = () => DesktopHitSurface.GetObstructions(source.Handle, desktopView,
+                liveWallpaper == null ? IntPtr.Zero : liveWallpaper.Handle);
+            desktopHits.HasLiveBackdrop = bounds => liveWallpaper != null && liveWallpaper.IsShowing(bounds);
             root.Children.Add(desktopHits);
             surface = new RangeSurface(round, targetIcons);
             root.Children.Add(surface);
 
-            hudStats = Text("", 16, Brushes.White);
+            hudTime = HudNumber(Brushes.White);
+            hudHits = HudNumber(Accent);
+            var metrics = new Grid();
+            AddHudColumn(metrics, HudMetric(hudTime, "剩余秒数"), 1);
+            AddHudColumn(metrics, HudMetric(hudHits, "命中"), 1);
+            hudShots = Text("", 12, Muted);
+            hudMode = Text("", 12, Muted);
+            var hudKey = Text("Esc 暂停", 12, Muted);
+            var hudFooter = new Grid { Margin = new Thickness(0, 8, 0, 0) };
+            AddHudColumn(hudFooter, hudShots, 1);
+            AddHudColumn(hudFooter, hudMode, 1.5);
+            AddHudColumn(hudFooter, hudKey, 1);
+            var hudContent = new StackPanel();
+            hudContent.Children.Add(metrics);
+            hudContent.Children.Add(hudFooter);
             hud = new Border
             {
-                Background = Ink, Padding = new Thickness(18, 10, 18, 10), CornerRadius = new CornerRadius(10),
-                Child = hudStats, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Top,
-                Margin = new Thickness(0, 16, 0, 0), IsHitTestVisible = false
+                Background = Ink, Padding = new Thickness(12, 9, 12, 10), CornerRadius = new CornerRadius(10),
+                Child = hudContent, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Top,
+                Width = 288, Margin = new Thickness(12, 16, 12, 0), IsHitTestVisible = false
             };
             root.Children.Add(hud);
 
             heading = Text("", 36, Brushes.White);
             heading.FontWeight = FontWeights.SemiBold;
+            headingValue = new Run();
+            headingUnit = new Run { FontSize = 23 };
+            heading.Inlines.Add(headingValue);
+            heading.Inlines.Add(headingUnit);
+            recordFeedback = Text("", 16, Accent);
+            recordFeedback.FontWeight = FontWeights.SemiBold;
+            recordFeedback.Margin = new Thickness(0, 4, 0, 3);
             details = Text("", 15, Muted);
             details.Margin = new Thickness(0, 8, 0, 22);
             notice = Text("", 13, Muted);
@@ -104,24 +137,41 @@ namespace DesktopIconFlick
             var ranges = Text(AimSettings.Ranges, 11, Muted);
             ranges.Margin = new Thickness(0, 6, 0, 12);
             iconInput = new CheckBox { Content = "使用我的桌面图标", IsChecked = profile.UseIcons, Foreground = Brushes.White, FontSize = 14 };
+            var soundInput = new CheckBox
+            {
+                Content = "命中音效", IsChecked = profile.PlayHitSound, Foreground = Brushes.White, FontSize = 14,
+                Margin = new Thickness(0, 8, 0, 0)
+            };
+            soundInput.Click += (sender, args) =>
+            {
+                profile.PlayHitSound = soundInput.IsChecked == true;
+                profile.Save();
+                RefreshNotice();
+            };
             var settingGroup = new StackPanel { Margin = new Thickness(0, 0, 0, 22) };
             settingGroup.Children.Add(fields);
             settingGroup.Children.Add(ranges);
             settingGroup.Children.Add(iconInput);
+            settingGroup.Children.Add(soundInput);
             settings = settingGroup;
 
             action = ControlButton("开始训练", Accent, Ink, StartOrResume);
             abandon = ControlButton("结束本局", Muted, Ink, () => { round.Cancel(); targetIcons.Clear(); ShowState(); });
             var exit = ControlButton("退出", Brushes.Transparent, Brushes.White, Close);
-            var controls = new WrapPanel();
+            controls = new WrapPanel();
             controls.Children.Add(action);
             controls.Children.Add(abandon);
             controls.Children.Add(exit);
             var content = new StackPanel();
             content.Children.Add(heading);
+            content.Children.Add(recordFeedback);
             content.Children.Add(details);
-            content.Children.Add(settings);
-            content.Children.Add(controls);
+            var options = new Grid();
+            options.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            options.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            options.Children.Add(settings);
+            options.Children.Add(controls);
+            content.Children.Add(options);
             content.Children.Add(notice);
             var scroller = new ScrollViewer { Content = content, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
             panel = new Border
@@ -135,6 +185,7 @@ namespace DesktopIconFlick
             {
                 panel.Width = Math.Min(448, Math.Max(0, root.ActualWidth - 28));
                 panel.MaxHeight = Math.Max(0, root.ActualHeight - 28);
+                hud.MaxWidth = Math.Max(0, root.ActualWidth - 24);
             };
             iconInput.Checked += (sender, args) => RefreshNotice();
             iconInput.Unchecked += (sender, args) => RefreshNotice();
@@ -169,6 +220,7 @@ namespace DesktopIconFlick
         {
             refreshDesktopOnActivate = false;
             int request = ++desktopLoad;
+            desktopHits.ClearPulses();
             var desktopArea = new Rect(workArea.Left, workArea.Top, workArea.Width, workArea.Height);
             desktopHits.DesktopArea = desktopArea;
             desktopHits.Wallpaper = null;
@@ -208,6 +260,7 @@ namespace DesktopIconFlick
             closed = true;
             CloseLiveWallpaper();
             ReleaseInput();
+            hitSound.Dispose();
             CompositionTarget.Rendering -= Advance;
             if (source != null && !source.IsDisposed)
                 source.RemoveHook(ProcessWindowMessage);
@@ -261,9 +314,16 @@ namespace DesktopIconFlick
             Target removed, replacement;
             if (round.Input(horizontal, vertical, pressed, out removed, out replacement))
             {
+                DesktopIcon icon = targetIcons.For(removed);
+                double timestamp = now();
+                hitUntil = timestamp + 0.08;
+                if (profile.PlayHitSound)
+                    hitSound.Play();
                 if (targetIcons.Replace(removed, replacement))
+                {
                     UpdateDesktopHits();
-                hitUntil = clock.Elapsed.TotalSeconds + 0.08;
+                    desktopHits.StartPulse(icon, timestamp);
+                }
             }
             TransitionAfterTick();
         }
@@ -344,7 +404,7 @@ namespace DesktopIconFlick
                 roundUsesIcons = profile.UseIcons && desktopIcons.Count > 0;
                 targetIcons.Start(round.Targets, roundUsesIcons ? desktopIcons : NoIcons);
             }
-            frameSampleStart = clock.Elapsed.TotalSeconds;
+            frameSampleStart = now();
             hitUntil = 0;
             message = "";
             Focus();
@@ -365,12 +425,17 @@ namespace DesktopIconFlick
 
         private void ReleaseInput()
         {
-            if (!mouse.Release())
-                return;
-            sampledSeconds += clock.Elapsed.TotalSeconds - frameSampleStart;
-            ForceCursor = false;
-            ClearValue(CursorProperty);
-            Mouse.UpdateCursor();
+            if (mouse.Release())
+            {
+                sampledSeconds += now() - frameSampleStart;
+                ForceCursor = false;
+                ClearValue(CursorProperty);
+                Mouse.UpdateCursor();
+            }
+            hitUntil = 0;
+            surface.Flash = false;
+            hitSound.Stop();
+            desktopHits.ClearPulses();
         }
 
         private void PauseRound(string reason)
@@ -410,7 +475,9 @@ namespace DesktopIconFlick
                 lastRenderTime = frame.RenderingTime;
                 frameCount++;
             }
-            surface.Flash = hitUntil > clock.Elapsed.TotalSeconds;
+            double timestamp = now();
+            surface.Flash = hitUntil > timestamp;
+            desktopHits.AdvancePulses(timestamp);
             surface.InvalidateVisual();
             UpdateHud();
         }
@@ -424,7 +491,12 @@ namespace DesktopIconFlick
         private void FinishRound()
         {
             ReleaseInput();
+            int previousBest = profile.Best;
             profile.RecordCompletedRound(round.Hits);
+            recordFeedback.Text = "";
+            if (round.Hits > previousBest)
+                recordFeedback.Text = previousBest == 0 ? "新纪录" :
+                    string.Format("新纪录 · 多命中 {0} 个", round.Hits - previousBest);
             if (report != null)
             {
                 Matrix scale = source.CompositionTarget.TransformToDevice;
@@ -445,25 +517,34 @@ namespace DesktopIconFlick
         {
             shownState = round.State;
             bool active = shownState == RoundState.Active, paused = shownState == RoundState.Paused;
+            bool finished = shownState == RoundState.Finished;
             panel.Visibility = active ? Visibility.Collapsed : Visibility.Visible;
             hud.Visibility = active ? Visibility.Visible : Visibility.Collapsed;
             settings.Visibility = paused ? Visibility.Collapsed : Visibility.Visible;
             abandon.Visibility = paused ? Visibility.Visible : Visibility.Collapsed;
+            recordFeedback.Visibility = finished && recordFeedback.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+            heading.FontSize = finished ? 54 : 36;
+            headingUnit.Text = finished ? " 命中" : "";
+            Grid.SetRow(settings, finished ? 1 : 0);
+            Grid.SetRow(controls, finished ? 0 : 1);
+            settings.Margin = finished ? new Thickness(0, 22, 0, 0) : new Thickness(0, 0, 0, 22);
+            KeyboardNavigation.SetTabIndex(controls, finished ? 0 : 1);
+            KeyboardNavigation.SetTabIndex(settings, finished ? 1 : 0);
             switch (shownState)
             {
                 case RoundState.Paused:
-                    heading.Text = "对局暂停";
+                    headingValue.Text = "对局暂停";
                     details.Text = string.Format("剩余 {0:0.0} 秒 · 命中 {1} / {2}", round.Remaining, round.Hits, round.Shots);
                     action.Content = "继续训练";
                     break;
                 case RoundState.Finished:
-                    heading.Text = "训练结束";
-                    details.Text = string.Format("命中 {0} · 射击 {1} · 命中率 {2:0.#}%\n个人最佳 {3} 命中",
-                        round.Hits, round.Shots, round.Accuracy, profile.Best);
+                    headingValue.Text = round.Hits.ToString(CultureInfo.CurrentCulture);
+                    details.Text = string.Format("命中率 {0:0.#}%  ·  射击 {1} 次\n个人最佳 {2} 命中",
+                        round.Accuracy, round.Shots, profile.Best);
                     action.Content = "再来一局";
                     break;
                 default:
-                    heading.Text = "桌面甩枪";
+                    headingValue.Text = "桌面甩枪";
                     details.Text = "固定准星 · 三个目标 · 30 秒\n甩动鼠标转向，左键击发。Esc 暂停。";
                     if (profile.Best > 0)
                         details.Text += string.Format("\n个人最佳 {0} 命中", profile.Best);
@@ -484,11 +565,46 @@ namespace DesktopIconFlick
             int seconds = (int)Math.Ceiling(round.Remaining);
             if (shownSecond == seconds && shownHits == round.Hits && shownShots == round.Shots)
                 return;
+            if (shownSecond != seconds)
+                hudTime.Text = seconds.ToString("00", CultureInfo.CurrentCulture);
+            if (shownHits != round.Hits)
+                hudHits.Text = round.Hits.ToString(CultureInfo.CurrentCulture);
+            if (shownShots != round.Shots)
+                hudShots.Text = string.Format("射击 {0}", round.Shots);
+            if (shownSecond == -1)
+                hudMode.Text = roundUsesIcons ? "图标" : profile.UseIcons ? "小球（回退）" : "小球";
             shownSecond = seconds;
             shownHits = round.Hits;
             shownShots = round.Shots;
-            hudStats.Text = string.Format("{0:00} 秒  /  命中 {1}/{2}  /  {3}  ·  Esc 暂停", seconds, round.Hits, round.Shots,
-                roundUsesIcons ? "图标" : profile.UseIcons ? "小球（本局回退）" : "小球");
+        }
+
+        private static TextBlock HudNumber(Brush color)
+        {
+            var number = Text("", 30, color);
+            number.FontWeight = FontWeights.SemiBold;
+            number.TextAlignment = TextAlignment.Center;
+            Typography.SetNumeralAlignment(number, FontNumeralAlignment.Tabular);
+            return number;
+        }
+
+        private static StackPanel HudMetric(TextBlock number, string caption)
+        {
+            var label = Text(caption, 12, Muted);
+            label.TextAlignment = TextAlignment.Center;
+            var metric = new StackPanel();
+            metric.Children.Add(number);
+            metric.Children.Add(label);
+            return metric;
+        }
+
+        private static void AddHudColumn(Grid row, FrameworkElement content, double width)
+        {
+            var text = content as TextBlock;
+            if (text != null)
+                text.TextAlignment = TextAlignment.Center;
+            Grid.SetColumn(content, row.ColumnDefinitions.Count);
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(width, GridUnitType.Star) });
+            row.Children.Add(content);
         }
 
         private void RefreshNotice()

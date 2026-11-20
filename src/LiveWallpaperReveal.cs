@@ -81,6 +81,11 @@ namespace DesktopIconFlick
 
         internal IntPtr Handle { get { return window == null ? IntPtr.Zero : window.Handle; } }
 
+        internal bool IsShowing(Rect desktopBounds)
+        {
+            return thumbnails.ContainsKey(desktopBounds);
+        }
+
         public bool Show(Rect desktopBounds)
         {
             const uint rootAncestor = 2;

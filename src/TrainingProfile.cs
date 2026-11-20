@@ -10,6 +10,7 @@ namespace DesktopIconFlick
         private readonly string path;
         public AimSettings Aim { get; private set; }
         public bool UseIcons { get; set; }
+        public bool PlayHitSound { get; set; }
         public int Best { get; private set; }
         public string Notice { get; private set; }
 
@@ -18,6 +19,7 @@ namespace DesktopIconFlick
             this.path = path;
             Aim = AimSettings.Default;
             UseIcons = true;
+            PlayHitSound = true;
             Notice = "";
         }
 
@@ -30,13 +32,16 @@ namespace DesktopIconFlick
                 AimSettings aim;
                 bool icons;
                 int best;
-                if (fields.Length != 5 || !AimSettings.TryRead(fields[0], fields[1], fields[2], out aim) ||
+                if ((fields.Length != 5 && fields.Length != 6) || !AimSettings.TryRead(fields[0], fields[1], fields[2], out aim) ||
                     !bool.TryParse(fields[3], out icons) ||
                     !int.TryParse(fields[4], NumberStyles.None, CultureInfo.InvariantCulture, out best))
                     throw new InvalidDataException();
                 profile.Aim = aim;
                 profile.UseIcons = icons;
                 profile.Best = best;
+                bool sound;
+                if (fields.Length == 6 && bool.TryParse(fields[5], out sound))
+                    profile.PlayHitSound = sound;
             }
             catch (FileNotFoundException) { }
             catch (DirectoryNotFoundException) { }
@@ -75,7 +80,8 @@ namespace DesktopIconFlick
                     Aim.Distance.ToString("R", CultureInfo.InvariantCulture),
                     Aim.HorizontalFov.ToString("R", CultureInfo.InvariantCulture),
                     UseIcons.ToString(),
-                    Best.ToString(CultureInfo.InvariantCulture)
+                    Best.ToString(CultureInfo.InvariantCulture),
+                    PlayHitSound.ToString()
                 });
                 if (File.Exists(path))
                     File.Replace(temporary, path, null);

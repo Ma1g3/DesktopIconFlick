@@ -1,7 +1,10 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Documents;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 
@@ -17,10 +20,13 @@ namespace DesktopIconFlick
             TrackCoveredDesktopIcons();
             ClockAndProfile();
             PauseAtDeadline();
+            HitFeedbackFollowsSuccessfulShots();
+            HudAndSettlementReflectRound();
             DecodePackets();
             MouseLifecycle();
             DrawSkins();
             DrawDesktopHits();
+            DesktopPulsesFollowVisibleReveals();
             SameNamedDesktopItemsUseVisibleIdentity();
             DesktopProbe.TransparentWindowsDoNotObstructDesktop();
             Console.WriteLine("Passed: aim math, projection, 18000 deterministic replacements, icon source tracking, clock, profile, raw packets, mouse lifecycle, offscreen skins, desktop masks, Shell identity matching, and native window occlusion.");
@@ -215,6 +221,20 @@ namespace DesktopIconFlick
                 Require(round.Hits == 0 && round.Shots == 0 && round.Remaining == 30 && round.Accuracy == 0, "restart / zero shots");
                 profile.RecordCompletedRound(0);
                 Require(TrainingProfile.Load(path).Best == 1, "best persists when reopened");
+                var oldSettings = new[] { "1600", "35", "90", "False", "28" };
+                File.WriteAllLines(path, oldSettings);
+                profile = TrainingProfile.Load(path);
+                Require(profile.PlayHitSound && !profile.UseIcons && profile.Best == 28 &&
+                    profile.Aim.Dpi == 1600 && profile.Aim.Distance == 35 && profile.Aim.HorizontalFov == 90,
+                    "legacy profiles preserve aim, appearance and best with sound on");
+                File.AppendAllLines(path, new[] { "broken" });
+                profile = TrainingProfile.Load(path);
+                Require(profile.PlayHitSound && !profile.UseIcons && profile.Best == 28 && profile.Aim.Dpi == 1600,
+                    "bad sound preference preserves the other settings");
+                profile.PlayHitSound = false;
+                profile.Save();
+                profile = TrainingProfile.Load(path);
+                Require(!profile.PlayHitSound && profile.Best == 28, "muted preference survives reopening");
                 File.WriteAllText(path, "broken");
                 profile = TrainingProfile.Load(path);
                 Require(profile.Aim == AimSettings.Default && profile.Notice.Length > 0, "bad profile fallback");
@@ -260,6 +280,144 @@ namespace DesktopIconFlick
         {
             Vector direction = center.Unit();
             camera.SetAngles(Math.Atan2(direction.X, direction.Z) * 180 / Math.PI, Math.Asin(direction.Y) * 180 / Math.PI + pitchOffset);
+        }
+
+        private static void HitFeedbackFollowsSuccessfulShots()
+        {
+            const BindingFlags instance = BindingFlags.Instance | BindingFlags.NonPublic;
+            string path = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"), "profile.txt");
+            double time = 0;
+            var window = new TrainingWindow(path, null, () => time, 9);
+            try
+            {
+                Type type = typeof(TrainingWindow);
+                var round = (TrainingRound)type.GetField("round", instance).GetValue(window);
+                var profile = (TrainingProfile)type.GetField("profile", instance).GetValue(window);
+                var icons = (TargetIcons)type.GetField("targetIcons", instance).GetValue(window);
+                FieldInfo hitUntil = type.GetField("hitUntil", instance);
+                MethodInfo applyInput = type.GetMethod("ApplyRoundInput", instance);
+                MethodInfo pause = type.GetMethod("PauseRound", instance);
+                profile.PlayHitSound = false;
+                round.Start(profile.Aim, 960, 540);
+                round.Camera.SetAngles(180, 0);
+                applyInput.Invoke(window, new object[] { 0, 0, true });
+                Require(round.Shots == 1 && round.Hits == 0 && (double)hitUntil.GetValue(window) == 0,
+                    "miss does not trigger hit feedback");
+
+                var art = new DrawingImage(new GeometryDrawing(Brushes.White, null, new RectangleGeometry(new Rect(0, 0, 8, 8))));
+                foreach (DesktopIcon[] appearance in new[] { new DesktopIcon[0], new[] { new DesktopIcon(art, Rect.Empty) } })
+                {
+                    icons.Start(round.Targets, appearance);
+                    Target before = round.Targets[0];
+                    Face(round.Camera, before.Center);
+                    double previous = (double)hitUntil.GetValue(window);
+                    time += 0.02;
+                    applyInput.Invoke(window, new object[] { 0, 0, true });
+                    Require(round.Targets.Count == 3 && round.Targets[0] != before && (double)hitUntil.GetValue(window) > previous,
+                        "ball and icon hits replace a target and refresh visual feedback even when muted");
+                }
+                Require(round.Hits == 2 && round.Shots == 3 && round.Remaining > 0, "feedback preserves round statistics");
+                pause.Invoke(window, new object[] { "" });
+                Require(round.State == RoundState.Paused && (double)hitUntil.GetValue(window) == 0, "pause clears hit feedback");
+                round.Resume();
+                Require((double)hitUntil.GetValue(window) == 0, "resume does not restore hit feedback");
+            }
+            finally
+            {
+                window.Close();
+            }
+        }
+
+        private static void HudAndSettlementReflectRound()
+        {
+            const BindingFlags instance = BindingFlags.Instance | BindingFlags.NonPublic;
+            string folder = Path.Combine(Path.GetTempPath(), "DesktopIconFlick-test-" + Guid.NewGuid().ToString("N"));
+            string path = Path.Combine(folder, "profile.txt");
+            double time = 0;
+            var window = new TrainingWindow(path, null, () => time, 23);
+            try
+            {
+                Type type = typeof(TrainingWindow);
+                var round = (TrainingRound)type.GetField("round", instance).GetValue(window);
+                var profile = (TrainingProfile)type.GetField("profile", instance).GetValue(window);
+                var hud = (Border)type.GetField("hud", instance).GetValue(window);
+                var hudTime = (TextBlock)type.GetField("hudTime", instance).GetValue(window);
+                var hudHits = (TextBlock)type.GetField("hudHits", instance).GetValue(window);
+                var hudShots = (TextBlock)type.GetField("hudShots", instance).GetValue(window);
+                var hudMode = (TextBlock)type.GetField("hudMode", instance).GetValue(window);
+                var heading = (TextBlock)type.GetField("heading", instance).GetValue(window);
+                var details = (TextBlock)type.GetField("details", instance).GetValue(window);
+                var record = (TextBlock)type.GetField("recordFeedback", instance).GetValue(window);
+                var action = (Button)type.GetField("action", instance).GetValue(window);
+                MethodInfo showState = type.GetMethod("ShowState", instance);
+                MethodInfo updateHud = type.GetMethod("UpdateHud", instance);
+                MethodInfo finish = type.GetMethod("TransitionAfterTick", instance);
+                var root = (FrameworkElement)window.Content;
+                const int width = 190, height = 340;
+
+                string[] appearances = { "图标", "小球", "小球（回退）" };
+                for (int index = 0; index < appearances.Length; index++)
+                {
+                    profile.UseIcons = index != 1;
+                    type.GetField("roundUsesIcons", instance).SetValue(window, index == 0);
+                    round.Start(profile.Aim, width, height);
+                    showState.Invoke(window, null);
+                    Require(hudTime.Text == "30" && hudHits.Text == "0" && hudShots.Text == "射击 0" &&
+                        hudMode.Text == appearances[index], "HUD shows timer, both counts and the actual appearance");
+                }
+                for (int index = 0; index < 9; index++)
+                {
+                    Face(round.Camera, round.Targets[0].Center);
+                    Require(round.Input(0, 0, true), "deterministic HUD hit");
+                }
+                updateHud.Invoke(window, null);
+                Pixels(root, width, height);
+                Point hitsOrigin = hudHits.TranslatePoint(new Point(), root);
+                double hitsWidth = hudHits.ActualWidth;
+                Face(round.Camera, round.Targets[0].Center);
+                round.Input(0, 0, true);
+                round.Camera.SetAngles(180, 0);
+                round.Input(0, 0, true);
+                updateHud.Invoke(window, null);
+                Pixels(root, width, height);
+                Require(hudHits.Text == "10" && hudShots.Text == "射击 11" && hud.ActualWidth < width &&
+                    hudHits.TranslatePoint(new Point(), root) == hitsOrigin && hudHits.ActualWidth == hitsWidth,
+                    "narrow HUD keeps fixed metric slots while counts grow");
+
+                int[] scores = { 0, 1, 1, 0, 3 };
+                string[] records = { "", "新纪录", "", "", "新纪录 · 多命中 2 个" };
+                for (int index = 0; index < scores.Length; index++)
+                {
+                    round.Start(profile.Aim, width, height);
+                    showState.Invoke(window, null);
+                    Require(hudHits.Text == "0" && hudShots.Text == "射击 0", "new round resets HUD counts");
+                    for (int hit = 0; hit < scores[index]; hit++)
+                    {
+                        Face(round.Camera, round.Targets[0].Center);
+                        Require(round.Input(0, 0, true), "deterministic settlement hit");
+                    }
+                    time += TrainingRound.Duration;
+                    round.Tick();
+                    finish.Invoke(window, null);
+                    string title = string.Concat(heading.Inlines.OfType<Run>().Select(run => run.Text));
+                    Require(title == scores[index] + " 命中" &&
+                        details.Text.Contains("个人最佳 " + profile.Best + " 命中") &&
+                        record.Text == records[index] && (string)action.Content == "再来一局",
+                        string.Format("settlement presents score {0}: title={1}, details={2}, record={3}, button={4}",
+                            scores[index], title, details.Text, record.Text, action.Content));
+                    if (scores[index] == 0)
+                        Require(details.Text.Contains("命中率 0%") && details.Text.Contains("射击 0 次"), "zero-shot settlement remains defined");
+                }
+                Require(TrainingProfile.Load(path).Best == 3, "updated record survives reopening");
+            }
+            finally
+            {
+                window.Close();
+                if (File.Exists(path))
+                    File.Delete(path);
+                if (Directory.Exists(folder))
+                    Directory.Delete(folder);
+            }
         }
 
         private static void DrawSkins()
@@ -366,6 +524,86 @@ namespace DesktopIconFlick
             surface.Wallpaper = null;
             byte[] fallback = Pixels(surface, width, height);
             Require(fallback[hitPixel + 3] == 0 && fallback[otherPixel + 3] == 0, "missing wallpaper leaves the original desktop visible");
+        }
+
+        private static void DesktopPulsesFollowVisibleReveals()
+        {
+            const int width = 200, height = 100;
+            var round = new TrainingRound(() => 0, 8);
+            round.Start(AimSettings.Default, width, height);
+            var art = new DrawingImage(new GeometryDrawing(Brushes.White, null, new RectangleGeometry(new Rect(0, 0, 8, 8))));
+            var first = new DesktopIcon(art, new Rect(100, 70, 40, 40), "first");
+            var second = new DesktopIcon(art, new Rect(150, 70, 30, 40), "second");
+            var targets = new TargetIcons();
+            targets.Start(round.Targets, new[] { first, second });
+            var wallpaper = new DesktopWallpaper(Colors.Orange, new Rect(0, 0, 600, 300));
+            var surface = new DesktopHitSurface(round, targets, Brushes.Transparent)
+            {
+                Wallpaper = wallpaper,
+                DesktopArea = new Rect(100, 50, 400, 200)
+            };
+            int firstCorner = (12 * width + 4) * 4, firstRightCorner = (12 * width + 16) * 4;
+            int secondCorner = (12 * width + 29) * 4;
+            Require(HitIcon(round, targets, 0) && HitIcon(round, targets, 1), "two desktop sources covered");
+            byte[] baseline = Pixels(surface, width, height);
+
+            surface.StartPulse(first, 1);
+            surface.StartPulse(second, 1.15);
+            surface.AdvancePulses(1.15);
+            byte[] active = Pixels(surface, width, height);
+            Require(BitConverter.ToUInt32(active, firstCorner) != BitConverter.ToUInt32(baseline, firstCorner) &&
+                BitConverter.ToUInt32(active, secondCorner) != BitConverter.ToUInt32(baseline, secondCorner),
+                "separate desktop corners are visible at scaled positions");
+            Require(!HitIcon(round, targets, 0), "repeat hit does not reveal a fresh desktop icon");
+            surface.AdvancePulses(1.23);
+            byte[] later = Pixels(surface, width, height);
+            Require(BitConverter.ToUInt32(later, firstCorner) == BitConverter.ToUInt32(baseline, firstCorner) &&
+                BitConverter.ToUInt32(later, secondCorner) != BitConverter.ToUInt32(baseline, secondCorner),
+                "the earlier desktop pulse expires independently");
+            surface.AdvancePulses(1.4);
+            Require(baseline.SequenceEqual(Pixels(surface, width, height)), "expiry removes feedback while leaving the desktop mask");
+
+            surface.ReadObstructions = () => new[] { new Rect(100, 70, 18, 40) };
+            surface.StartPulse(first, 2);
+            surface.AdvancePulses(2);
+            byte[] clipped = Pixels(surface, width, height);
+            Require(clipped[firstCorner + 3] == 0 && BitConverter.ToUInt32(clipped, firstRightCorner) !=
+                BitConverter.ToUInt32(baseline, firstRightCorner), "pulse respects partial occlusion");
+            surface.ReadObstructions = () => new[] { first.DesktopBounds };
+            surface.AdvancePulses(2.01);
+            Require(Pixels(surface, width, height)[firstRightCorner + 3] == 0, "a newly occluding window hides the active pulse");
+            surface.ClearPulses();
+            surface.StartPulse(first, 3);
+            surface.ReadObstructions = null;
+            surface.AdvancePulses(3);
+            Require(baseline.SequenceEqual(Pixels(surface, width, height)), "a fully obstructed hit did not start a pulse");
+
+            surface.Wallpaper = null;
+            surface.StartPulse(first, 4);
+            surface.Wallpaper = wallpaper;
+            surface.AdvancePulses(4);
+            Require(baseline.SequenceEqual(Pixels(surface, width, height)), "missing background did not start a pulse");
+
+            surface.StartPulse(first, 5);
+            surface.AdvancePulses(5);
+            round.Pause();
+            surface.ClearPulses();
+            Require(Pixels(surface, width, height)[firstCorner + 3] == 0, "pause removes the pulse and backdrop");
+            round.Resume();
+            surface.AdvancePulses(5.01);
+            Require(baseline.SequenceEqual(Pixels(surface, width, height)), "resuming restores the backdrop only");
+
+            surface.Wallpaper = null;
+            surface.HasLiveBackdrop = bounds => bounds == first.DesktopBounds;
+            surface.StartPulse(first, 6);
+            surface.StartPulse(second, 6);
+            surface.AdvancePulses(6);
+            byte[] live = Pixels(surface, width, height);
+            Require(live[firstCorner + 3] > 0 && live[secondCorner + 3] == 0,
+                "only a registered live backdrop shows the pulse, without a static wallpaper patch");
+            surface.HasLiveBackdrop = bounds => false;
+            surface.AdvancePulses(6.01);
+            Require(Pixels(surface, width, height)[firstCorner + 3] == 0, "pulse disappears when live backdrop is no longer registered");
         }
 
         private static void SameNamedDesktopItemsUseVisibleIdentity()

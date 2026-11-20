@@ -94,7 +94,7 @@ namespace DesktopIconFlick
             return brush;
         }
 
-        private static Pen Stroke(Brush color, double width)
+        internal static Pen Stroke(Brush color, double width)
         {
             var pen = new Pen(color, width);
             pen.Freeze();

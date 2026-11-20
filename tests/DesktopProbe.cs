@@ -81,6 +81,9 @@ namespace DesktopIconFlick
                 if (obstructions == null || obstructions.Contains(bounds[invisible]) ||
                     !obstructions.Contains(bounds[translucent]) || !obstructions.Contains(bounds[opaque]))
                     throw new InvalidOperationException("Only the visible desktop obstruction test windows should obstruct icons.");
+                obstructions = DesktopHitSurface.GetObstructions(windows[overlay], windows[backdrop], windows[opaque]);
+                if (obstructions == null || obstructions.Contains(bounds[opaque]) || !obstructions.Contains(bounds[translucent]))
+                    throw new InvalidOperationException("The known live wallpaper compositor should not obstruct icon effects.");
             }
             finally
             {
