@@ -6,20 +6,38 @@ namespace DesktopIconFlick
 {
     internal sealed class AimSettings
     {
-        public const string Ranges = "DPI 100–32000 · cm/360 5–200 · 水平 FOV 60–120°";
-        public static readonly AimSettings Default = new AimSettings(800, 40, 100);
+        private const int DefaultDpi = 800;
+        private const double DefaultDistance = 40;
+        private const double LocalDpiScale = DefaultDpi * DefaultDpi * DefaultDistance;
+        public const string LocalRanges = "局内 DPI 4–51200 · 水平 FOV 60–120°";
+        public const string CalibrationRanges = "硬件 DPI 100–32000 · cm/360 5–200";
+        public static readonly AimSettings Default = new AimSettings(DefaultDpi, DefaultDistance, 100, DefaultDpi);
         public readonly int Dpi;
         public readonly double Distance;
         public readonly double HorizontalFov;
+        public readonly double LocalDpi;
 
-        private AimSettings(int dpi, double distance, double horizontalFov)
+        private AimSettings(int dpi, double distance, double horizontalFov, double localDpi)
         {
             Dpi = dpi;
             Distance = distance;
             HorizontalFov = horizontalFov;
+            LocalDpi = localDpi;
         }
 
-        public double DegreesPerCount { get { return 360.0 * 2.54 / (Dpi * Distance); } }
+        public double DegreesPerCount { get { return LocalDpi * (360.0 * 2.54 / LocalDpiScale); } }
+        public string LocalDpiText { get { return LocalDpi.ToString("0.####", CultureInfo.InvariantCulture); } }
+
+        public bool TryReadLocal(string localDpi, string fov, out AimSettings settings)
+        {
+            double dpiValue, fovValue;
+            settings = null;
+            if (!double.TryParse(localDpi, NumberStyles.Float, CultureInfo.InvariantCulture, out dpiValue) ||
+                !(dpiValue >= 4 && dpiValue <= 51200) || !TryReadFov(fov, out fovValue))
+                return false;
+            settings = new AimSettings(Dpi, Distance, fovValue, dpiValue);
+            return true;
+        }
 
         public static bool TryRead(string dpi, string distance, string fov, out AimSettings settings)
         {
@@ -28,12 +46,16 @@ namespace DesktopIconFlick
             settings = null;
             if (!int.TryParse(dpi, NumberStyles.Integer, CultureInfo.InvariantCulture, out dpiValue) ||
                 !double.TryParse(distance, NumberStyles.Float, CultureInfo.InvariantCulture, out distanceValue) ||
-                !double.TryParse(fov, NumberStyles.Float, CultureInfo.InvariantCulture, out fovValue) ||
-                !(dpiValue >= 100 && dpiValue <= 32000 && distanceValue >= 5 && distanceValue <= 200 &&
-                  fovValue >= 60 && fovValue <= 120))
+                !(dpiValue >= 100 && dpiValue <= 32000 && distanceValue >= 5 && distanceValue <= 200) ||
+                !TryReadFov(fov, out fovValue))
                 return false;
-            settings = new AimSettings(dpiValue, distanceValue, fovValue);
+            settings = new AimSettings(dpiValue, distanceValue, fovValue, LocalDpiScale / (dpiValue * distanceValue));
             return true;
+        }
+
+        private static bool TryReadFov(string fov, out double value)
+        {
+            return double.TryParse(fov, NumberStyles.Float, CultureInfo.InvariantCulture, out value) && value >= 60 && value <= 120;
         }
     }
 

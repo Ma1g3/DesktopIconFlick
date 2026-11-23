@@ -31,7 +31,7 @@ namespace DesktopIconFlick
         private readonly Border panel, hud;
         private readonly TextBlock heading, details, notice, recordFeedback, hudTime, hudHits, hudShots, hudMode;
         private readonly Run headingValue, headingUnit;
-        private readonly TextBox dpiInput, distanceInput, fovInput;
+        private readonly TextBox localDpiInput, fovInput;
         private readonly CheckBox iconInput;
         private readonly FrameworkElement settings;
         private readonly Button action, abandon;
@@ -122,20 +122,12 @@ namespace DesktopIconFlick
             notice = Text("", 13, Muted);
             notice.Margin = new Thickness(0, 14, 0, 0);
 
-            dpiInput = Field("鼠标 DPI", profile.Aim.Dpi.ToString(CultureInfo.InvariantCulture));
-            distanceInput = Field("cm/360", profile.Aim.Distance.ToString(CultureInfo.InvariantCulture));
+            localDpiInput = Field("局内 DPI", profile.Aim.LocalDpiText);
             fovInput = Field("水平 FOV", profile.Aim.HorizontalFov.ToString(CultureInfo.InvariantCulture));
-            var fields = new Grid();
-            foreach (TextBox field in new[] { dpiInput, distanceInput, fovInput })
-            {
-                int column = fields.ColumnDefinitions.Count;
-                fields.ColumnDefinitions.Add(new ColumnDefinition());
-                FrameworkElement labeled = LabelField(field, column == 2 ? 0 : 12);
-                Grid.SetColumn(labeled, column);
-                fields.Children.Add(labeled);
-            }
-            var ranges = Text(AimSettings.Ranges, 11, Muted);
-            ranges.Margin = new Thickness(0, 6, 0, 12);
+            var aimHelp = Text("局内 DPI 越大，训练转向越快。", 12, Muted);
+            aimHelp.Margin = new Thickness(0, 8, 0, 0);
+            var ranges = Text(AimSettings.LocalRanges, 11, Muted);
+            ranges.Margin = new Thickness(0, 4, 0, 10);
             iconInput = new CheckBox { Content = "使用我的桌面图标", IsChecked = profile.UseIcons, Foreground = Brushes.White, FontSize = 14 };
             var soundInput = new CheckBox
             {
@@ -149,8 +141,10 @@ namespace DesktopIconFlick
                 RefreshNotice();
             };
             var settingGroup = new StackPanel { Margin = new Thickness(0, 0, 0, 22) };
-            settingGroup.Children.Add(fields);
+            settingGroup.Children.Add(AimFields(localDpiInput, fovInput));
+            settingGroup.Children.Add(aimHelp);
             settingGroup.Children.Add(ranges);
+            settingGroup.Children.Add(BuildCalibrationSettings());
             settingGroup.Children.Add(iconInput);
             settingGroup.Children.Add(soundInput);
             settings = settingGroup;
@@ -375,7 +369,7 @@ namespace DesktopIconFlick
             if (displayQueued || round.State == RoundState.Active)
                 return;
             bool resume = round.State == RoundState.Paused;
-            if (!resume && !profile.SetAim(dpiInput.Text, distanceInput.Text, fovInput.Text))
+            if (!resume && !profile.SetLocalAim(localDpiInput.Text, fovInput.Text))
             {
                 message = "请检查输入范围。上一组有效设置未更改。";
                 RefreshNotice();
@@ -626,6 +620,55 @@ namespace DesktopIconFlick
         private static TextBlock Text(string value, double size, Brush color)
         {
             return new TextBlock { Text = value, FontSize = size, Foreground = color, TextWrapping = TextWrapping.Wrap };
+        }
+
+        private Expander BuildCalibrationSettings()
+        {
+            var hardwareDpi = Field("硬件 DPI", profile.Aim.Dpi.ToString(CultureInfo.InvariantCulture));
+            var distance = Field("转身距离（cm/360）", profile.Aim.Distance.ToString("R", CultureInfo.InvariantCulture));
+            var body = new StackPanel { Margin = new Thickness(0, 8, 0, 0) };
+            var help = Text("填鼠标当前硬件 DPI 和水平转一圈的移动距离。", 12, Muted);
+            help.Margin = new Thickness(0, 0, 0, 8);
+            body.Children.Add(help);
+            body.Children.Add(AimFields(hardwareDpi, distance));
+            var ranges = Text(AimSettings.CalibrationRanges, 11, Muted);
+            ranges.Margin = new Thickness(0, 6, 0, 8);
+            body.Children.Add(ranges);
+            var feedback = Text("", 12, Muted);
+            var apply = ControlButton("应用校准", Brushes.Transparent, Brushes.White, () =>
+            {
+                string fov = profile.Aim.HorizontalFov.ToString("R", CultureInfo.InvariantCulture);
+                if (!profile.SetAim(hardwareDpi.Text, distance.Text, fov))
+                {
+                    feedback.Text = "请检查硬件 DPI 和转身距离的输入范围。";
+                    return;
+                }
+                localDpiInput.Text = profile.Aim.LocalDpiText;
+                profile.Save();
+                message = "";
+                RefreshNotice();
+                feedback.Text = "已应用局内 DPI " + localDpiInput.Text + "。";
+            });
+            apply.HorizontalAlignment = HorizontalAlignment.Left;
+            body.Children.Add(apply);
+            body.Children.Add(feedback);
+            return new Expander
+            {
+                Header = "高级校准", Content = body, Foreground = Muted, FontSize = 13,
+                Margin = new Thickness(0, 0, 0, 14)
+            };
+        }
+
+        private static Grid AimFields(TextBox left, TextBox right)
+        {
+            var fields = new Grid();
+            fields.ColumnDefinitions.Add(new ColumnDefinition());
+            fields.ColumnDefinitions.Add(new ColumnDefinition());
+            fields.Children.Add(LabelField(left, 12));
+            FrameworkElement second = LabelField(right, 0);
+            Grid.SetColumn(second, 1);
+            fields.Children.Add(second);
+            return fields;
         }
 
         private static TextBox Field(string label, string value)
