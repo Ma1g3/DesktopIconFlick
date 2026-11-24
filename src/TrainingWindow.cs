@@ -14,7 +14,7 @@ using System.Windows.Threading;
 
 namespace DesktopIconFlick
 {
-    internal sealed class TrainingWindow : Window
+    internal sealed partial class TrainingWindow : Window
     {
         private const int WallpaperChange = 0x0014;
         private static readonly DesktopIcon[] NoIcons = new DesktopIcon[0];
@@ -29,12 +29,12 @@ namespace DesktopIconFlick
         private readonly TargetIcons targetIcons = new TargetIcons();
         private readonly DesktopHitSurface desktopHits;
         private readonly Border panel, hud;
-        private readonly TextBlock heading, details, notice, recordFeedback, hudTime, hudHits, hudShots, hudMode;
+        private readonly TextBlock heading, details, notice, recordFeedback, hudTime, hudHits, hudShots, hudMode, hudKey;
         private readonly Run headingValue, headingUnit;
         private readonly TextBox localDpiInput, fovInput;
         private readonly CheckBox iconInput;
         private readonly FrameworkElement settings;
-        private readonly Button action, abandon;
+        private readonly Button action, abandon, competitionButton;
         private readonly WrapPanel controls;
         private HwndSource source;
         private WindowsDesktop.Rect workArea;
@@ -92,7 +92,7 @@ namespace DesktopIconFlick
             AddHudColumn(metrics, HudMetric(hudHits, "命中"), 1);
             hudShots = Text("", 12, Muted);
             hudMode = Text("", 12, Muted);
-            var hudKey = Text("Esc 暂停", 12, Muted);
+            hudKey = Text("Esc 暂停", 12, Muted);
             var hudFooter = new Grid { Margin = new Thickness(0, 8, 0, 0) };
             AddHudColumn(hudFooter, hudShots, 1);
             AddHudColumn(hudFooter, hudMode, 1.5);
@@ -151,10 +151,12 @@ namespace DesktopIconFlick
 
             action = ControlButton("开始训练", Accent, Ink, StartOrResume);
             abandon = ControlButton("结束本局", Muted, Ink, () => { round.Cancel(); targetIcons.Clear(); ShowState(); });
+            competitionButton = ControlButton("局域网竞赛", Brushes.Transparent, Brushes.White, OpenCompetition);
             var exit = ControlButton("退出", Brushes.Transparent, Brushes.White, Close);
             controls = new WrapPanel();
             controls.Children.Add(action);
             controls.Children.Add(abandon);
+            controls.Children.Add(competitionButton);
             controls.Children.Add(exit);
             var content = new StackPanel();
             content.Children.Add(heading);
@@ -167,7 +169,11 @@ namespace DesktopIconFlick
             options.Children.Add(controls);
             content.Children.Add(options);
             content.Children.Add(notice);
-            var scroller = new ScrollViewer { Content = content, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
+            soloContent = content;
+            var views = new Grid();
+            views.Children.Add(soloContent);
+            views.Children.Add(BuildCompetitionView());
+            var scroller = new ScrollViewer { Content = views, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
             panel = new Border
             {
                 Child = scroller, Padding = new Thickness(26), Background = Ink, CornerRadius = new CornerRadius(14),
@@ -192,7 +198,10 @@ namespace DesktopIconFlick
             Deactivated += (sender, args) =>
             {
                 refreshDesktopOnActivate = true;
-                PauseRound("切出窗口，对局已暂停。");
+                if (competitionOpen)
+                    InterruptCompetition(LanPlayerStatus.Unfocused);
+                else
+                    PauseRound("切出窗口，对局已暂停。");
             };
             Closing += (sender, args) => ReleaseInput();
             Closed += CloseSource;
@@ -252,6 +261,7 @@ namespace DesktopIconFlick
         private void CloseSource(object sender, EventArgs args)
         {
             closed = true;
+            DisposeCompetitionSession();
             CloseLiveWallpaper();
             ReleaseInput();
             hitSound.Dispose();
@@ -264,10 +274,15 @@ namespace DesktopIconFlick
         {
             if (messageId == WindowsDesktop.InputMessage && IsActive && mouse.CanRead(window))
             {
-                int horizontal, vertical;
-                bool pressed;
-                if (WindowsDesktop.ReadMouse(data, out horizontal, out vertical, out pressed))
-                    ApplyRoundInput(horizontal, vertical, pressed);
+                if (competitionRun != null && !mouse.HasConfinement())
+                    InterruptCompetition(LanPlayerStatus.CaptureLost);
+                else
+                {
+                    int horizontal, vertical;
+                    bool pressed;
+                    if (WindowsDesktop.ReadMouse(data, out horizontal, out vertical, out pressed))
+                        ApplyRoundInput(horizontal, vertical, pressed);
+                }
             }
             else if (messageId == WindowsDesktop.DisplayChange || messageId == WindowsDesktop.DpiChange ||
                      (messageId == WindowsDesktop.SettingChange && param.ToInt64() == WindowsDesktop.WorkAreaChange))
@@ -276,7 +291,9 @@ namespace DesktopIconFlick
                 {
                     displayQueued = true;
                     bool active = round.State == RoundState.Active || round.State == RoundState.Paused;
-                    if (active)
+                    if (competitionOpen)
+                        InterruptCompetition(LanPlayerStatus.DisplayChanged);
+                    else if (active)
                     {
                         ReleaseInput();
                         round.Cancel();
@@ -358,6 +375,14 @@ namespace DesktopIconFlick
             args.Handled = true;
             if (args.IsRepeat)
                 return;
+            if (competitionOpen)
+            {
+                if (competitionPrepared || competitionRun != null)
+                    InterruptCompetition(LanPlayerStatus.Withdrew);
+                else
+                    LeaveCompetition();
+                return;
+            }
             if (round.State == RoundState.Active)
                 PauseRound("");
             else
@@ -390,13 +415,8 @@ namespace DesktopIconFlick
                 round.Resume();
             else
             {
-                frameCount = 0;
-                motionPacketCount = 0;
-                sampledSeconds = 0;
-                lastRenderTime = TimeSpan.MinValue;
                 round.Start(profile.Aim, surface.ActualWidth, surface.ActualHeight);
-                roundUsesIcons = profile.UseIcons && desktopIcons.Count > 0;
-                targetIcons.Start(round.Targets, roundUsesIcons ? desktopIcons : NoIcons);
+                PrepareRoundPresentation();
             }
             frameSampleStart = now();
             hitUntil = 0;
@@ -405,9 +425,24 @@ namespace DesktopIconFlick
             ShowState();
         }
 
+        private void PrepareRoundPresentation()
+        {
+            frameCount = 0;
+            motionPacketCount = 0;
+            sampledSeconds = 0;
+            lastRenderTime = TimeSpan.MinValue;
+            roundUsesIcons = profile.UseIcons && desktopIcons.Count > 0;
+            targetIcons.Start(round.Targets, roundUsesIcons ? desktopIcons : NoIcons);
+        }
+
+        private bool IsForegroundTraining()
+        {
+            return source != null && IsActive && WindowsDesktop.GetForegroundWindow() == source.Handle;
+        }
+
         private bool AcquireInput()
         {
-            if (source == null || !IsActive || WindowsDesktop.GetForegroundWindow() != source.Handle ||
+            if (!IsForegroundTraining() ||
                 surface.ActualWidth <= 1 || surface.ActualHeight <= 1 ||
                 !mouse.TryAcquire(source.Handle))
                 return false;
@@ -449,14 +484,20 @@ namespace DesktopIconFlick
         {
             if (round.State != RoundState.Active)
                 return;
-            if (!IsActive || WindowsDesktop.GetForegroundWindow() != source.Handle)
+            if (!IsForegroundTraining())
             {
-                PauseRound("切出窗口，对局已暂停。");
+                if (competitionRun != null)
+                    InterruptCompetition(LanPlayerStatus.Unfocused);
+                else
+                    PauseRound("切出窗口，对局已暂停。");
                 return;
             }
             if (!mouse.HasConfinement())
             {
-                PauseRound("鼠标控制已释放，请手动继续。");
+                if (competitionRun != null)
+                    InterruptCompetition(LanPlayerStatus.CaptureLost);
+                else
+                    PauseRound("鼠标控制已释放，请手动继续。");
                 return;
             }
             round.Tick();
@@ -478,8 +519,15 @@ namespace DesktopIconFlick
 
         private void TransitionAfterTick()
         {
-            if (round.State == RoundState.Finished && shownState != RoundState.Finished)
+            if (round.State != RoundState.Finished || shownState == RoundState.Finished)
+                return;
+            if (competitionRun == null)
                 FinishRound();
+            else
+            {
+                CompleteCompetitionRound();
+                ShowState();
+            }
         }
 
         private void FinishRound()
@@ -510,12 +558,21 @@ namespace DesktopIconFlick
         private void ShowState()
         {
             shownState = round.State;
+            soloContent.Visibility = competitionOpen ? Visibility.Collapsed : Visibility.Visible;
+            competitionContent.Visibility = competitionOpen ? Visibility.Visible : Visibility.Collapsed;
+            if (competitionOpen)
+            {
+                RefreshCompetition(null, EventArgs.Empty);
+                return;
+            }
+            hudKey.Text = "Esc 暂停";
             bool active = shownState == RoundState.Active, paused = shownState == RoundState.Paused;
             bool finished = shownState == RoundState.Finished;
             panel.Visibility = active ? Visibility.Collapsed : Visibility.Visible;
             hud.Visibility = active ? Visibility.Visible : Visibility.Collapsed;
             settings.Visibility = paused ? Visibility.Collapsed : Visibility.Visible;
             abandon.Visibility = paused ? Visibility.Visible : Visibility.Collapsed;
+            competitionButton.Visibility = paused ? Visibility.Collapsed : Visibility.Visible;
             recordFeedback.Visibility = finished && recordFeedback.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
             heading.FontSize = finished ? 54 : 36;
             headingUnit.Text = finished ? " 命中" : "";

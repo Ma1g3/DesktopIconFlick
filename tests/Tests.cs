@@ -10,14 +10,38 @@ using System.Windows.Media.Imaging;
 
 namespace DesktopIconFlick
 {
-    internal static class Tests
+    internal static partial class Tests
     {
         [STAThread]
-        public static int Main()
+        public static int Main(string[] args)
         {
+            if (args.Length == 1 && args[0] == "--desktop-competition")
+            {
+                try
+                {
+                    CompetitionDesktopInputLifecycle();
+                    return 0;
+                }
+                catch (Exception failure)
+                {
+                    for (Exception error = failure; error != null; error = error.InnerException)
+                    {
+                        Console.Error.WriteLine(error.GetType().FullName + ": " + error.Message);
+                        Console.Error.WriteLine(error.StackTrace);
+                    }
+                    return 1;
+                }
+            }
             CameraAndSettings();
             LocalDpiControlsTurn();
             ReplaysAndTargetPlacement();
+            CompetitionSharesTargetGeometry();
+            CompetitionUsesScheduledShotWindow();
+            LanFramesAndConnections();
+            LanRoomTracksPlayersAndReadiness();
+            LanStartsAtMappedTimeAndLocksRoster();
+            LanCollectsAndPublishesFinalRankings();
+            CompetitionRoomUpdatesOnDispatcher();
             TrackCoveredDesktopIcons();
             ClockAndProfile();
             PauseAtDeadline();
@@ -30,7 +54,7 @@ namespace DesktopIconFlick
             DesktopPulsesFollowVisibleReveals();
             SameNamedDesktopItemsUseVisibleIdentity();
             DesktopProbe.TransparentWindowsDoNotObstructDesktop();
-            Console.WriteLine("Passed: aim math, projection, 18000 deterministic replacements, icon source tracking, clock, profile, raw packets, mouse lifecycle, offscreen skins, desktop masks, Shell identity matching, and native window occlusion.");
+            Console.WriteLine("Passed: solo training and desktop regressions, deterministic competition geometry, LAN framing, room roster, clock mapping, ranking, and WPF room updates.");
             return 0;
         }
 
