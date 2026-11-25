@@ -10,13 +10,38 @@ using System.Windows.Media.Imaging;
 
 namespace DesktopIconFlick
 {
-    internal static class Tests
+    internal static partial class Tests
     {
         [STAThread]
-        public static int Main()
+        public static int Main(string[] args)
         {
+            if (args.Length == 1 && args[0] == "--desktop-competition")
+            {
+                try
+                {
+                    CompetitionDesktopInputLifecycle();
+                    return 0;
+                }
+                catch (Exception failure)
+                {
+                    for (Exception error = failure; error != null; error = error.InnerException)
+                    {
+                        Console.Error.WriteLine(error.GetType().FullName + ": " + error.Message);
+                        Console.Error.WriteLine(error.StackTrace);
+                    }
+                    return 1;
+                }
+            }
             CameraAndSettings();
+            LocalDpiControlsTurn();
             ReplaysAndTargetPlacement();
+            CompetitionSharesTargetGeometry();
+            CompetitionUsesScheduledShotWindow();
+            LanFramesAndConnections();
+            LanRoomTracksPlayersAndReadiness();
+            LanStartsAtMappedTimeAndLocksRoster();
+            LanCollectsAndPublishesFinalRankings();
+            CompetitionRoomUpdatesOnDispatcher();
             TrackCoveredDesktopIcons();
             ClockAndProfile();
             PauseAtDeadline();
@@ -29,7 +54,7 @@ namespace DesktopIconFlick
             DesktopPulsesFollowVisibleReveals();
             SameNamedDesktopItemsUseVisibleIdentity();
             DesktopProbe.TransparentWindowsDoNotObstructDesktop();
-            Console.WriteLine("Passed: aim math, projection, 18000 deterministic replacements, icon source tracking, clock, profile, raw packets, mouse lifecycle, offscreen skins, desktop masks, Shell identity matching, and native window occlusion.");
+            Console.WriteLine("Passed: solo training and desktop regressions, deterministic competition geometry, LAN framing, room roster, clock mapping, ranking, and WPF room updates.");
             return 0;
         }
 
@@ -56,6 +81,33 @@ namespace DesktopIconFlick
             foreach (string invalid in new[] { "NaN", "Infinity", "-Infinity", "1e999", "0", "201", "not-a-number" })
                 Require(!profile.SetAim("800", invalid, "60") && profile.Aim == AimSettings.Default, "preserve valid settings: " + invalid);
             Require(!profile.SetAim("0", "40", "100") && !profile.SetAim("800", "40", "180"), "reject out-of-range DPI and FOV");
+        }
+
+        private static void LocalDpiControlsTurn()
+        {
+            var profile = new TrainingProfile("unused");
+            var standard = new AimCamera(profile.Aim);
+            Require(profile.SetLocalAim("1600", "100"), "accept a higher local DPI");
+            var faster = new AimCamera(profile.Aim);
+            standard.Move(1000, -200);
+            faster.Move(1000, -200);
+            Near(faster.Yaw, standard.Yaw * 2, 0.000001, "doubled local DPI doubles yaw");
+            Near(faster.Pitch, standard.Pitch * 2, 0.000001, "doubled local DPI doubles pitch");
+            Require(profile.Aim.Dpi == 800 && profile.Aim.Distance == 40, "local setting preserves calibration inputs");
+
+            AimSettings valid = profile.Aim;
+            foreach (string invalid in new[] { "3.99", "51201", "NaN", "Infinity", "garbage" })
+                Require(!profile.SetLocalAim(invalid, "100") && profile.Aim == valid, "reject invalid local DPI: " + invalid);
+            Require(!profile.SetLocalAim("800", "180") && profile.Aim == valid, "reject invalid FOV atomically");
+
+            Require(profile.SetAim("32000", "200", "100") && profile.Aim.LocalDpi == 4 &&
+                profile.SetLocalAim(profile.Aim.LocalDpiText, "100"), "minimum calibrated local DPI is valid");
+            Require(profile.SetAim("100", "5", "100") && profile.Aim.LocalDpi == 51200 &&
+                profile.SetLocalAim(profile.Aim.LocalDpiText, "100"), "maximum calibrated local DPI is valid");
+            Require(profile.SetAim("1600", "40", "100"), "calibrate distance at higher hardware DPI");
+            var calibrated = new AimCamera(profile.Aim);
+            calibrated.Move(6300, 0);
+            Near(calibrated.Yaw, 90, 0.02, "advanced calibration still honors cm/360");
         }
 
         private static void ReplaysAndTargetPlacement()
@@ -227,6 +279,10 @@ namespace DesktopIconFlick
                 Require(profile.PlayHitSound && !profile.UseIcons && profile.Best == 28 &&
                     profile.Aim.Dpi == 1600 && profile.Aim.Distance == 35 && profile.Aim.HorizontalFov == 90,
                     "legacy profiles preserve aim, appearance and best with sound on");
+                double calibratedDpi = profile.Aim.LocalDpi;
+                Near(profile.Aim.DegreesPerCount, 360 * 2.54 / (1600 * 35), 0.000000001, "legacy turn is preserved");
+                Require(profile.SetLocalAim(profile.Aim.LocalDpiText, "90") && profile.Aim.LocalDpi == calibratedDpi,
+                    "unchanged display text preserves the exact migrated local DPI");
                 File.AppendAllLines(path, new[] { "broken" });
                 profile = TrainingProfile.Load(path);
                 Require(profile.PlayHitSound && !profile.UseIcons && profile.Best == 28 && profile.Aim.Dpi == 1600,
@@ -235,6 +291,15 @@ namespace DesktopIconFlick
                 profile.Save();
                 profile = TrainingProfile.Load(path);
                 Require(!profile.PlayHitSound && profile.Best == 28, "muted preference survives reopening");
+                Require(profile.SetLocalAim("925.25", "90"), "accept fractional local DPI");
+                profile.Save();
+                profile = TrainingProfile.Load(path);
+                Require(profile.Aim.LocalDpi == 925.25 && profile.Aim.Dpi == 1600 && profile.Aim.Distance == 35,
+                    "local DPI and calibration inputs persist independently");
+                File.WriteAllLines(path, new[] { "1600", "35", "90", "False", "28", "False", "NaN" });
+                profile = TrainingProfile.Load(path);
+                Require(profile.Aim.LocalDpi == calibratedDpi && profile.Best == 28 && !profile.PlayHitSound && profile.Notice.Length > 0,
+                    "invalid local DPI falls back to the saved calibration");
                 File.WriteAllText(path, "broken");
                 profile = TrainingProfile.Load(path);
                 Require(profile.Aim == AimSettings.Default && profile.Notice.Length > 0, "bad profile fallback");

@@ -32,7 +32,7 @@ namespace DesktopIconFlick
                 AimSettings aim;
                 bool icons;
                 int best;
-                if ((fields.Length != 5 && fields.Length != 6) || !AimSettings.TryRead(fields[0], fields[1], fields[2], out aim) ||
+                if ((fields.Length < 5 || fields.Length > 7) || !AimSettings.TryRead(fields[0], fields[1], fields[2], out aim) ||
                     !bool.TryParse(fields[3], out icons) ||
                     !int.TryParse(fields[4], NumberStyles.None, CultureInfo.InvariantCulture, out best))
                     throw new InvalidDataException();
@@ -40,8 +40,16 @@ namespace DesktopIconFlick
                 profile.UseIcons = icons;
                 profile.Best = best;
                 bool sound;
-                if (fields.Length == 6 && bool.TryParse(fields[5], out sound))
+                if (fields.Length >= 6 && bool.TryParse(fields[5], out sound))
                     profile.PlayHitSound = sound;
+                if (fields.Length == 7)
+                {
+                    AimSettings localAim;
+                    if (aim.TryReadLocal(fields[6], fields[2], out localAim))
+                        profile.Aim = localAim;
+                    else
+                        profile.Notice = "局内 DPI 读取失败，已按保存的校准值恢复。";
+                }
             }
             catch (FileNotFoundException) { }
             catch (DirectoryNotFoundException) { }
@@ -58,6 +66,17 @@ namespace DesktopIconFlick
         {
             AimSettings aim;
             if (!AimSettings.TryRead(dpi, distance, fov, out aim))
+                return false;
+            Aim = aim;
+            return true;
+        }
+
+        public bool SetLocalAim(string localDpi, string fov)
+        {
+            if (localDpi == Aim.LocalDpiText)
+                localDpi = Aim.LocalDpi.ToString("R", CultureInfo.InvariantCulture);
+            AimSettings aim;
+            if (!Aim.TryReadLocal(localDpi, fov, out aim))
                 return false;
             Aim = aim;
             return true;
@@ -81,7 +100,8 @@ namespace DesktopIconFlick
                     Aim.HorizontalFov.ToString("R", CultureInfo.InvariantCulture),
                     UseIcons.ToString(),
                     Best.ToString(CultureInfo.InvariantCulture),
-                    PlayHitSound.ToString()
+                    PlayHitSound.ToString(),
+                    Aim.LocalDpi.ToString("R", CultureInfo.InvariantCulture)
                 });
                 if (File.Exists(path))
                     File.Replace(temporary, path, null);

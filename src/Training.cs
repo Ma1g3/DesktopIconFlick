@@ -6,20 +6,38 @@ namespace DesktopIconFlick
 {
     internal sealed class AimSettings
     {
-        public const string Ranges = "DPI 100–32000 · cm/360 5–200 · 水平 FOV 60–120°";
-        public static readonly AimSettings Default = new AimSettings(800, 40, 100);
+        private const int DefaultDpi = 800;
+        private const double DefaultDistance = 40;
+        private const double LocalDpiScale = DefaultDpi * DefaultDpi * DefaultDistance;
+        public const string LocalRanges = "局内 DPI 4–51200 · 水平 FOV 60–120°";
+        public const string CalibrationRanges = "硬件 DPI 100–32000 · cm/360 5–200";
+        public static readonly AimSettings Default = new AimSettings(DefaultDpi, DefaultDistance, 100, DefaultDpi);
         public readonly int Dpi;
         public readonly double Distance;
         public readonly double HorizontalFov;
+        public readonly double LocalDpi;
 
-        private AimSettings(int dpi, double distance, double horizontalFov)
+        private AimSettings(int dpi, double distance, double horizontalFov, double localDpi)
         {
             Dpi = dpi;
             Distance = distance;
             HorizontalFov = horizontalFov;
+            LocalDpi = localDpi;
         }
 
-        public double DegreesPerCount { get { return 360.0 * 2.54 / (Dpi * Distance); } }
+        public double DegreesPerCount { get { return LocalDpi * (360.0 * 2.54 / LocalDpiScale); } }
+        public string LocalDpiText { get { return LocalDpi.ToString("0.####", CultureInfo.InvariantCulture); } }
+
+        public bool TryReadLocal(string localDpi, string fov, out AimSettings settings)
+        {
+            double dpiValue, fovValue;
+            settings = null;
+            if (!double.TryParse(localDpi, NumberStyles.Float, CultureInfo.InvariantCulture, out dpiValue) ||
+                !(dpiValue >= 4 && dpiValue <= 51200) || !TryReadFov(fov, out fovValue))
+                return false;
+            settings = new AimSettings(Dpi, Distance, fovValue, dpiValue);
+            return true;
+        }
 
         public static bool TryRead(string dpi, string distance, string fov, out AimSettings settings)
         {
@@ -28,12 +46,16 @@ namespace DesktopIconFlick
             settings = null;
             if (!int.TryParse(dpi, NumberStyles.Integer, CultureInfo.InvariantCulture, out dpiValue) ||
                 !double.TryParse(distance, NumberStyles.Float, CultureInfo.InvariantCulture, out distanceValue) ||
-                !double.TryParse(fov, NumberStyles.Float, CultureInfo.InvariantCulture, out fovValue) ||
-                !(dpiValue >= 100 && dpiValue <= 32000 && distanceValue >= 5 && distanceValue <= 200 &&
-                  fovValue >= 60 && fovValue <= 120))
+                !(dpiValue >= 100 && dpiValue <= 32000 && distanceValue >= 5 && distanceValue <= 200) ||
+                !TryReadFov(fov, out fovValue))
                 return false;
-            settings = new AimSettings(dpiValue, distanceValue, fovValue);
+            settings = new AimSettings(dpiValue, distanceValue, fovValue, LocalDpiScale / (dpiValue * distanceValue));
             return true;
+        }
+
+        private static bool TryReadFov(string fov, out double value)
+        {
+            return double.TryParse(fov, NumberStyles.Float, CultureInfo.InvariantCulture, out value) && value >= 60 && value <= 120;
         }
     }
 
@@ -148,6 +170,8 @@ namespace DesktopIconFlick
         private const double SpawnHalfWidth = 0.18;
         private const double SpawnHalfHeightLimit = 0.14;
         private const double SpawnVerticalViewportFraction = 0.27;
+        private static readonly double CompetitionSpawnHalfHeight =
+            Math.Tan(Math.PI / 6) * (9.0 / 16) * SpawnVerticalViewportFraction;
         private const int SpawnColumns = 5;
         private const int SpawnRows = 3;
         private readonly Func<double> now;
@@ -155,6 +179,8 @@ namespace DesktopIconFlick
         private readonly List<Target> targets = new List<Target>(3);
         private readonly IList<Target> readOnlyTargets;
         private readonly Vector[] spawnCenters = new Vector[SpawnColumns * SpawnRows];
+        private Random spawnRandom;
+        private double? competitionDeadline;
         private int nextId;
         private double used, startedAt;
 
@@ -171,12 +197,37 @@ namespace DesktopIconFlick
         public int Hits { get; private set; }
         public int Shots { get; private set; }
         public double Accuracy { get { return Shots == 0 ? 0 : 100.0 * Hits / Shots; } }
-        public double Remaining { get { return Math.Max(0, Duration - (State == RoundState.Active ? ActiveTime(now()) : used)); } }
+        public double Remaining
+        {
+            get
+            {
+                if (State != RoundState.Active)
+                    return Duration - used;
+                double time = now();
+                return Math.Max(0, competitionDeadline.HasValue
+                    ? Math.Min(Duration, competitionDeadline.Value - time)
+                    : Duration - ActiveTime(time));
+            }
+        }
 
         public void Start(AimSettings settings, double width, double height)
         {
             Camera = new AimCamera(settings);
-            SetSpawnCenters(width, height);
+            double vertical = Math.Min(SpawnHalfHeightLimit,
+                Camera.HalfWidthSlope * height / width * SpawnVerticalViewportFraction);
+            StartRound(vertical, random, null);
+        }
+
+        public void StartCompetition(AimSettings settings, int seed, double startsAt)
+        {
+            Camera = new AimCamera(settings);
+            StartRound(CompetitionSpawnHalfHeight, new Random(seed), startsAt);
+        }
+
+        private void StartRound(double vertical, Random roundRandom, double? competitionStart)
+        {
+            spawnRandom = roundRandom;
+            SetSpawnCenters(vertical);
             used = 0;
             Hits = 0;
             Shots = 0;
@@ -184,24 +235,25 @@ namespace DesktopIconFlick
             targets.Clear();
             while (targets.Count < 3)
                 targets.Add(Spawn(true));
-            startedAt = now();
+            startedAt = competitionStart ?? now();
+            competitionDeadline = competitionStart + Duration;
             State = RoundState.Active;
         }
 
         public void Tick()
         {
             if (State == RoundState.Active)
-                FinishIfExpired(ActiveTime(now()));
+                FinishIfExpired(now());
         }
 
         public void Pause()
         {
             if (State != RoundState.Active)
                 return;
-            double elapsed = ActiveTime(now());
-            if (FinishIfExpired(elapsed))
+            double time = now();
+            if (FinishIfExpired(time) || competitionDeadline.HasValue)
                 return;
-            used = elapsed;
+            used = ActiveTime(time);
             State = RoundState.Paused;
         }
 
@@ -210,9 +262,12 @@ namespace DesktopIconFlick
             return used + (timestamp - startedAt);
         }
 
-        private bool FinishIfExpired(double elapsed)
+        private bool FinishIfExpired(double timestamp)
         {
-            if (elapsed < Duration)
+            bool expired = competitionDeadline.HasValue
+                ? timestamp >= competitionDeadline.Value
+                : ActiveTime(timestamp) >= Duration;
+            if (!expired)
                 return false;
             used = Duration;
             State = RoundState.Finished;
@@ -242,8 +297,10 @@ namespace DesktopIconFlick
         public bool Input(int horizontal, int vertical, bool pressed, out Target removed, out Target replacement)
         {
             removed = replacement = null;
-            Tick();
             if (State != RoundState.Active)
+                return false;
+            double time = now();
+            if (FinishIfExpired(time) || (competitionDeadline.HasValue && time < startedAt))
                 return false;
             Camera.Move(horizontal, vertical);
             if (!pressed)
@@ -271,12 +328,10 @@ namespace DesktopIconFlick
             return true;
         }
 
-        private void SetSpawnCenters(double width, double height)
+        private void SetSpawnCenters(double vertical)
         {
             // Store opening-camera rays in world space. Even when the rows are close,
             // the spacing between columns guarantees room for a replacement.
-            double verticalHalfSlope = Camera.HalfWidthSlope * height / width;
-            double vertical = Math.Min(SpawnHalfHeightLimit, verticalHalfSlope * SpawnVerticalViewportFraction);
             for (int row = 0; row < SpawnRows; row++)
                 for (int column = 0; column < SpawnColumns; column++)
                 {
@@ -289,7 +344,7 @@ namespace DesktopIconFlick
         private Target Spawn(bool opening)
         {
             double spacing = Target.Radius * 2.5;
-            int start = random.Next(spawnCenters.Length);
+            int start = spawnRandom.Next(spawnCenters.Length);
             for (int offset = 0; offset < spawnCenters.Length; offset++)
             {
                 Vector center = spawnCenters[(start + offset) % spawnCenters.Length];
